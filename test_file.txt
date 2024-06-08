@@ -1,0 +1,114 @@
+Lorem ipsum dolor sit amet, consectetur adipiscing elit. Aenean tincidunt vel 
+urna nec luctus. Aenean cursus, dui eu rhoncus efficitur, ligula elit imperdiet 
+lectus, dignissim lacinia urna risus non justo. Aenean non vestibulum metus, 
+et aliquet ligula. Duis et odio vel purus tincidunt bibendum. Fusce iaculis 
+eleifend mollis. Nullam eget orci lacus. Phasellus non sagittis velit, 
+quis accumsan justo.
+
+Nullam a posuere libero. Pellentesque interdum vel orci non aliquet. Vivamus 
+dapibus laoreet dolor et pellentesque. Suspendisse purus ligula, vehicula in 
+vulputate et, venenatis in turpis. Mauris volutpat semper purus, at auctor purus vehicula vitae. Etiam ut purus sit amet lorem 
+ultrices suscipit vitae quis odio. Nam facilisis porttitor leo, at feugiat est 
+pretium a. Nam euismod scelerisque mi, sit amet pharetra purus tincidunt quis.
+
+Maecenas dapibus at risus sed bibendum. Suspendisse est mauris, posuere at 
+enim elementum, fringilla venenatis mauris. Fusce magna sapien, malesuada a 
+ex non, molestie porttitor felis. Nunc justo odio, rhoncus sit amet leo 
+eget, mollis semper eros. Cras quis mattis leo, ut aliquet sapien. Nullam interdum nisi 
+leo, nec lobortis justo aliquet vel. Vivamus et feugiat ipsum. Maecenas sit amet augue 
+massa. Mauris mauris neque, lobortis nec orci vitae, rutrum eleifend dolor. Ut auctor 
+vehicula est, vitae egestas velit efficitur vitae. Vivamus sagittis accumsan blandit. Vivamus 
+condimentum quis sapien sed auctor. Morbi pulvinar, nulla quis dapibus tempus, 
+augue risus ullamcorper turpis, at laoreet ante ligula sed libero.
+
+Etiam a enim fermentum, congue arcu at, accumsan mi. In rutrum augue ex, in egestas nunc 
+vestibulum eu. Duis vestibulum hendrerit arcu vel fermentum. Ut vel lobortis dui, 
+sit amet eleifend velit. Donec tincidunt lorem eu dolor bibendum, nec rutrum leo mollis
+. Fusce scelerisque turpis a lectus venenatis ultrices. Duis dapibus euismod sem in lacinia
+. Donec sodales luctus ullamcorper. Vivamus in ipsum eget erat fringilla pretium vel non 
+tortor. Quisque eu feugiat quam. Praesent dictum massa malesuada laoreet tristique. Aenean nisl velit, eleifend at interdum 
+eget, ornare quis quam.
+
+Quisque tempus, metus eu convallis imperdiet, elit mi eleifend nisi, sed tincidunt ligula lectus 
+eu ligula. Nullam faucibus odio non libero sodales hendrerit. Morbi non 
+nibh ante. Praesent lacus massa, gravida id odio quis, scelerisque eleifend nibh. Nullam 
+a faucibus arcu. Nulla eu ex molestie, sollicitudin nisi id, ultrices ipsum. Morbi laoreet 
+ullamcorper congue. Morbi sed quam pharetra ante venenatis pellentesque. Cras ut accumsan 
+leo.
+
+FMT_CONSTEXPR inline auto utf8_decode(const char* s, uint32_t* c, int* e)
+    -> const char* {
+  constexpr const int masks[] = {0x00, 0x7f, 0x1f, 0x0f, 0x07};
+  constexpr const uint32_t mins[] = {4194304, 0, 128, 2048, 65536};
+  constexpr const int shiftc[] = {0, 18, 12, 6, 0};
+  constexpr const int shifte[] = {0, 6, 4, 2, 0};
+
+  int len = "\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\0\0\0\0\0\0\0\0\2\2\2\2\3\3\4"
+      [static_cast<unsigned char>(*s) >> 3];
+  // Compute the pointer to the next character early so that the next
+  // iteration can start working on the next character. Neither Clang
+  // nor GCC figure out this reordering on their own.
+  const char* next = s + len + !len;
+
+  using uchar = unsigned char;
+
+  // Assume a four-byte character and load four bytes. Unused bits are
+  // shifted out.
+  *c = uint32_t(uchar(s[0]) & masks[len]) << 18;
+  *c |= uint32_t(uchar(s[1]) & 0x3f) << 12;
+  *c |= uint32_t(uchar(s[2]) & 0x3f) << 6;
+  *c |= uint32_t(uchar(s[3]) & 0x3f) << 0;
+  *c >>= shiftc[len];
+
+  // Accumulate the various error conditions.
+  *e = (*c < mins[len]) << 6;       // non-canonical encoding
+  *e |= ((*c >> 11) == 0x1b) << 7;  // surrogate half?
+  *e |= (*c > 0x10FFFF) << 8;       // out of range?
+  *e |= (uchar(s[1]) & 0xc0) >> 2;
+  *e |= (uchar(s[2]) & 0xc0) >> 4;
+  *e |= uchar(s[3]) >> 6;
+  *e ^= 0x2a;  // top two bits of each tail byte correct?
+  *e >>= shifte[len];
+
+  return next;
+}
+
+constexpr FMT_INLINE_VARIABLE uint32_t invalid_code_point = ~uint32_t();
+
+// Invokes f(cp, sv) for every code point cp in s with sv being the string view
+// corresponding to the code point. cp is invalid_code_point on error.
+template <typename F>
+FMT_CONSTEXPR void for_each_codepoint(string_view s, F f) {
+  auto decode = [f](const char* buf_ptr, const char* ptr) {
+    auto cp = uint32_t();
+    auto error = 0;
+    auto end = utf8_decode(buf_ptr, &cp, &error);
+    bool result = f(error ? invalid_code_point : cp,
+                    string_view(ptr, error ? 1 : to_unsigned(end - buf_ptr)));
+    return result ? (error ? buf_ptr + 1 : end) : nullptr;
+  };
+  auto p = s.data();
+  const size_t block_size = 4;  // utf8_decode always reads blocks of 4 chars.
+  if (s.size() >= block_size) {
+    for (auto end = p + s.size() - block_size + 1; p < end;) {
+      p = decode(p, p);
+      if (!p) return;
+    }
+  }
+  if (auto num_chars_left = s.data() + s.size() - p) {
+    char buf[2 * block_size - 1] = {};
+    copy<char>(p, p + num_chars_left, buf);
+    const char* buf_ptr = buf;
+    do {
+      auto end = decode(buf_ptr, p);
+      if (!end) return;
+      p += end - buf_ptr;
+      buf_ptr = end;
+    } while (buf_ptr - buf < num_chars_left);
+  }
+}
+
+template <typename Char>
+inline auto compute_width(basic_string_view<Char> s) -> size_t {
+  return s.size();
+}

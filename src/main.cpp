@@ -49,6 +49,10 @@ enum EditorKey {
 
 struct EditorRow {
     std::string data;
+
+    int len() {
+        return (int)data.size();
+    }
 };
 
 struct EditorConfig {
@@ -56,6 +60,7 @@ struct EditorConfig {
     int screencols;
     int cx, cy;
     int rowoff;
+    int coloff;
     EditorMode mode;
 
     termios ogtermios;
@@ -186,21 +191,42 @@ void ewrite(const std::string& str) {
     E.abuf.append(str);
 }
 
+void ewrite_cstr_with_len(const char* str, usize len) {
+    E.abuf.append(str, len);
+}
+
 void ewrite_with_len(const std::string& str, usize len) {
     E.abuf.append(str, 0, len);
 }
 
 void do_action(EditorAction a) {
+    EditorRow* row = (E.cy >= (int)E.rows.size()) ? NULL : E.rows[E.cy];
     switch (a) {
-        case CURSOR_LEFT:  if (E.cx != 0) E.cx--; break;
-        case CURSOR_RIGHT: if (E.cx != E.screencols-1) E.cx++; break;
+        case CURSOR_LEFT: {
+            if (E.cx != 0) E.cx--;
+            else if (E.cy > 0) {
+                E.cy--;
+                E.cx = E.rows[E.cy]->len();
+            }
+        } break;
+        case CURSOR_RIGHT: {
+            if (row && E.cx < row->len()) E.cx++;
+            else if (row && E.cx == row->len()) {
+                E.cy++;
+                E.cx = 0;
+            }
+        } break;
         case CURSOR_UP:    if (E.cy != 0) E.cy--; break;
-        case CURSOR_DOWN:  if (E.cy != E.screenrows-1) E.cy++; break;
+        case CURSOR_DOWN:  if (E.cy < (int)E.rows.size()) E.cy++; break;
         case CURSOR_LINE_BEGIN: E.cx = 0; break;
         case CURSOR_LINE_END: E.cx = E.screencols-1; break;
         case EDITOR_EXIT:  core::succ_exit(); break;
         default: assert(0 && "do_action(): unknown action");
     }
+
+    row = (E.cy >= (int)E.rows.size()) ? NULL : E.rows[E.cy];
+    int rowlen = row ? row->len() : 0;
+    if (E.cx > rowlen) E.cx = rowlen;
 }
 
 void process_keypress() {
@@ -208,11 +234,11 @@ void process_keypress() {
     if (E.mode == NORMAL) {
         switch (c) {
             case CTRL_KEY('q'): do_action(EDITOR_EXIT); break;
-            case CTRL_KEY('f'):
-            case CTRL_KEY('c'): {
+            case CTRL_KEY('d'):
+            case CTRL_KEY('e'): {
                 int times = E.screenrows;
                 while (times--)
-                    do_action(c == CTRL_KEY('f') ? CURSOR_UP : CURSOR_DOWN);
+                    do_action(c == CTRL_KEY('e') ? CURSOR_UP : CURSOR_DOWN);
             } break;
             case 'a': do_action(CURSOR_LINE_BEGIN); break;
             case ';': do_action(CURSOR_LINE_END); break;
@@ -234,7 +260,16 @@ void process_keypress() {
 
 void scroll() {
     if (E.cy < E.rowoff) {
-
+        E.rowoff = E.cy;
+    }
+    if (E.cy >= E.rowoff + E.screenrows) {
+        E.rowoff = E.cy - E.screenrows + 1;
+    }
+    if (E.cx < E.coloff) {
+        E.coloff = E.cx;
+    }
+    if (E.cx >= E.coloff + E.screencols) {
+        E.coloff = E.cx - E.screencols + 1;
     }
 }
 
@@ -263,21 +298,27 @@ void draw_rows() {
             }
 
         } else {
-            int rowlen = (int)E.rows[filerow]->data.size();
+            int rowlen = E.rows[filerow]->len() - E.coloff;
+            if (rowlen < 0) rowlen = 0;
             if (rowlen > E.screencols) rowlen = E.screencols;
-            ewrite_with_len(E.rows[filerow]->data, rowlen);
+            ewrite_cstr_with_len(&E.rows[filerow]->data.data()[E.coloff], rowlen);
         }
 
         ewrite("\x1b[K");
-        if (y < E.screenrows-1) {
+        //if (y < E.screenrows-1) { // TODO: temp
             ewrite("\r\n");
-        }
+        //}
     }
 
-    ewrite(fmt::format("rowoff: {}\r\n", E.rowoff));
+    std::string debug_info = fmt::format("cx: {}, cy = {}, rowoff: {}", E.cx, E.cy, E.rowoff);
+    int len = debug_info.size();
+    if (len > E.screencols) len = E.screencols;
+    ewrite_with_len(debug_info, len);
+    ewrite("\x1b[K");
 }
 
 void refresh_screen() {
+    scroll();
     E.abuf.clear();
     ewrite("\x1b[?25l");
     ewrite("\x1b[H");
@@ -285,7 +326,12 @@ void refresh_screen() {
     draw_rows();
 
     char buf[32];
-    usize len = snprintf(buf, sizeof(buf)-1, "\x1b[%d;%dH", E.cy+1, E.cx+1);
+    usize len = snprintf(
+        buf,
+        sizeof(buf)-1,
+        "\x1b[%d;%dH",
+        (E.cy-E.rowoff)+1,
+        (E.cx-E.coloff)+1);
     ewrite(std::string(buf, 0, len));
     ewrite("\x1b[?25h");
 
@@ -296,6 +342,7 @@ void init_editor() {
     E.cx = 0;
     E.cy = 0;
     E.rowoff = 0;
+    E.coloff = 0;
     E.mode = NORMAL;
     if (get_window_size(&E.screenrows, &E.screencols) == -1)
         core::error_exit_from("get_window_size");
