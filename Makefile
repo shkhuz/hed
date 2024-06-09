@@ -11,10 +11,11 @@ FLAGS := -g -O0 -Wall -Wextra -Wno-unused-parameter -D_DEBUG
 CC := g++
 
 run: $(OBJS) build/a.out
-	./build/a.out test_file.txt
+	#./build/a.out test_file.txt
+	./build/a.out Makefile
 
 debug: $(OBJS) build/a.out
-	gdb ./build/a.out
+	gdb --args ./build/a.out Makefile
 
 build/a.out: $(OBJS)
 	$(CC) -o build/a.out $(FLAGS) $(OBJS) $(LIBS)

@@ -10,6 +10,7 @@
 #include <vector>
 #include <fstream>
 #include <cassert>
+#include <ctime>
 
 #include <fmt/format.h>
 
@@ -25,6 +26,8 @@ typedef int32_t i32;
 typedef int64_t i64;
 typedef ssize_t isize;
 
+const int TAB_STOP = 4;
+
 enum EditorMode {
     NORMAL,
     INSERT,
@@ -37,10 +40,13 @@ enum EditorAction {
     CURSOR_RIGHT,
     CURSOR_LINE_BEGIN,
     CURSOR_LINE_END,
+    MODE_CHANGE_NORMAL,
+    MODE_CHANGE_INSERT,
     EDITOR_EXIT,
 };
 
 enum EditorKey {
+    BACKSPACE = 127,
     ARROW_LEFT = 1000,
     ARROW_RIGHT,
     ARROW_UP,
@@ -49,23 +55,31 @@ enum EditorKey {
 
 struct EditorRow {
     std::string data;
+    std::string rdata;
 
     int len() {
         return (int)data.size();
+    }
+
+    int rlen() {
+        return (int)rdata.size();
     }
 };
 
 struct EditorConfig {
     int screenrows;
     int screencols;
-    int cx, cy;
+    int cx, cy, rx;
     int rowoff;
     int coloff;
     EditorMode mode;
+    std::string path;
 
     termios ogtermios;
     std::string abuf;
     std::vector<EditorRow*> rows;
+    std::string cmdline;
+    time_t cmdline_msg_time;
 };
 EditorConfig E;
 
@@ -121,18 +135,16 @@ void enable_raw_mode() {
 }
 
 int read_key() {
-    char c;
+    char buf[64];
     int nread;
-    while ((nread = read(STDIN_FILENO, &c, 1)) == 0);
+    while ((nread = read(STDIN_FILENO, buf, 64)) == 0);
     if (nread == -1 && errno != EAGAIN) core::error_exit_from("read");
 
-    if (c == '\x1b') {
-        char seq[3];
-        if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
-        if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
-
-        if (seq[0] == '[') {
-            switch (seq[1]) {
+    if (buf[0] == '\x1b' && nread == 1) {
+        return '\x1b';
+    } else if (nread > 1) {
+        if (buf[1] == '[') {
+            switch (buf[2]) {
                 case 'A': return ARROW_UP;
                 case 'B': return ARROW_DOWN;
                 case 'C': return ARROW_RIGHT;
@@ -141,7 +153,7 @@ int read_key() {
         }
         return '\x1b';
     }
-    return c;
+    return buf[0];
 }
 
 int get_cursor_position(int* rows, int* cols) {
@@ -168,9 +180,51 @@ int get_window_size(int* rows, int* cols) {
         return get_cursor_position(rows, cols);
     } else {
         *cols = ws.ws_col;
-        *rows = ws.ws_row-1; // TODO: temporary
+        // one line for status bar
+        //*rows = ws.ws_row-2;
+        *rows = ws.ws_row-3; // TODO: debug_temp
     }
     return 0;
+}
+
+int row_cx_to_rx(EditorRow* row, int cx) {
+    int rx = 0;
+    for (int i = 0; i < cx; i++) {
+        if (row->data[i] == '\t') {
+            rx += (TAB_STOP-1) - (rx%TAB_STOP);
+        }
+        rx++;
+    }
+    return rx;
+}
+
+void update_row(EditorRow* row) {
+    row->rdata.reserve(100);
+    row->rdata.clear();
+    for (int i = 0; i < row->len(); i++) {
+        if (row->data[i] == '\t') {
+            row->rdata.push_back(' ');
+            while (row->rlen() % TAB_STOP != 0) {
+                row->rdata.push_back(' ');
+            }
+        } else {
+            row->rdata.push_back(row->data[i]);
+        }
+    }
+    row->rdata.push_back('\0');
+}
+
+void append_row(const std::string& data) {
+    EditorRow* row = new EditorRow();
+    row->data = data;
+    E.rows.push_back(row);
+    update_row(row);
+}
+
+void row_insert_char(EditorRow* row, int at, int c) {
+    if (at < 0 || at > row->len()) at = row->len();
+    row->data.insert(at, 1, c);
+    update_row(row);
 }
 
 void open_file(const std::string& path) {
@@ -179,10 +233,9 @@ void open_file(const std::string& path) {
 
     if (!f) core::error_exit_with_msg("file not found");
     while (std::getline(f, line)) {
-        EditorRow* row = new EditorRow();
-        row->data = line;
-        E.rows.push_back(row);
+        append_row(line);
     }
+    E.path = path;
 }
 
 // =========== high level ==============
@@ -197,6 +250,20 @@ void ewrite_cstr_with_len(const char* str, usize len) {
 
 void ewrite_with_len(const std::string& str, usize len) {
     E.abuf.append(str, 0, len);
+}
+
+void insert_char(int c) {
+    if (E.cy == (int)E.rows.size()) {
+        append_row("");
+    }
+    row_insert_char(E.rows[E.cy], E.cx, c);
+    E.cx++;
+}
+
+template<typename... Args>
+void set_cmdline_msg(const std::string& fmt, Args... args) {
+    E.cmdline = fmt::format(fmt, args...);
+    E.cmdline_msg_time = time(NULL);
 }
 
 void do_action(EditorAction a) {
@@ -219,7 +286,11 @@ void do_action(EditorAction a) {
         case CURSOR_UP:    if (E.cy != 0) E.cy--; break;
         case CURSOR_DOWN:  if (E.cy < (int)E.rows.size()) E.cy++; break;
         case CURSOR_LINE_BEGIN: E.cx = 0; break;
-        case CURSOR_LINE_END: E.cx = E.screencols-1; break;
+        case CURSOR_LINE_END: if (row) E.cx = row->len(); break;
+
+        case MODE_CHANGE_NORMAL: E.mode = NORMAL; break;
+        case MODE_CHANGE_INSERT: E.mode = INSERT; break;
+
         case EDITOR_EXIT:  core::succ_exit(); break;
         default: assert(0 && "do_action(): unknown action");
     }
@@ -233,9 +304,19 @@ void process_keypress() {
     int c = read_key();
     if (E.mode == NORMAL) {
         switch (c) {
+            case 'i': do_action(MODE_CHANGE_INSERT); break;
             case CTRL_KEY('q'): do_action(EDITOR_EXIT); break;
             case CTRL_KEY('d'):
             case CTRL_KEY('e'): {
+                if (c == CTRL_KEY('e')) {
+                    E.cy = E.rowoff;
+                } else if (c == CTRL_KEY('d')) {
+                    E.cy = E.rowoff + E.screenrows - 1;
+                    if (E.cy > (int)E.rows.size()) {
+                        E.cy = (int)E.rows.size();
+                    }
+                }
+
                 int times = E.screenrows;
                 while (times--)
                     do_action(c == CTRL_KEY('e') ? CURSOR_UP : CURSOR_DOWN);
@@ -250,26 +331,42 @@ void process_keypress() {
             case 'j': do_action(CURSOR_DOWN); break;
             case 'k': do_action(CURSOR_UP); break;
             case 'l': do_action(CURSOR_RIGHT); break;
-            default: core::error_exit_with_msg("process_keypress(): unknown key");
+            case BACKSPACE: break;
+            case '\r': break;
+            case '\x1b': break;
+            default: {
+                set_cmdline_msg("invalid key '{}' in normal mode", (int)c);
+            } break;
         }
 
     } else if (E.mode == INSERT) {
-
+        switch (c) {
+            case '\x1b': do_action(MODE_CHANGE_NORMAL); break;
+            default: {
+                if (c >= 32 && c <= 126) insert_char(c);
+                else set_cmdline_msg("non-printable key '{}' in insert mode", (int)c);
+            } break;
+        }
     }
 }
 
 void scroll() {
+    E.rx = 0;
+    if (E.cy < (int)E.rows.size()) {
+        E.rx = row_cx_to_rx(E.rows[E.cy], E.cx);
+    }
+
     if (E.cy < E.rowoff) {
         E.rowoff = E.cy;
     }
     if (E.cy >= E.rowoff + E.screenrows) {
         E.rowoff = E.cy - E.screenrows + 1;
     }
-    if (E.cx < E.coloff) {
-        E.coloff = E.cx;
+    if (E.rx < E.coloff) {
+        E.coloff = E.rx;
     }
-    if (E.cx >= E.coloff + E.screencols) {
-        E.coloff = E.cx - E.screencols + 1;
+    if (E.rx >= E.coloff + E.screencols) {
+        E.coloff = E.rx - E.screencols + 1;
     }
 }
 
@@ -298,18 +395,65 @@ void draw_rows() {
             }
 
         } else {
-            int rowlen = E.rows[filerow]->len() - E.coloff;
+            int rowlen = E.rows[filerow]->rlen() - E.coloff;
             if (rowlen < 0) rowlen = 0;
             if (rowlen > E.screencols) rowlen = E.screencols;
-            ewrite_cstr_with_len(&E.rows[filerow]->data.data()[E.coloff], rowlen);
+            ewrite_cstr_with_len(&E.rows[filerow]->rdata.data()[E.coloff], rowlen);
         }
 
         ewrite("\x1b[K");
-        //if (y < E.screenrows-1) { // TODO: temp
+        if (y < E.screenrows-1) {
             ewrite("\r\n");
-        //}
+        }
+    }
+}
+
+void draw_status_bar() {
+    ewrite("\r\n");
+    if (E.mode == NORMAL) {
+        ewrite("\x1b[1;47;30m");
+    } else {
+        ewrite("\x1b[1;44;30m");
     }
 
+    std::string lstatus = fmt::format(
+            "[{}]{:.20} - {} lines",
+            E.mode == NORMAL ? 'N' : 'I',
+            E.path != "" ? E.path : "[No name]",
+            E.rows.size());
+    int llen = lstatus.size();
+    if (llen > E.screencols) llen = E.screencols;
+
+    std::string rstatus = fmt::format("{}/{}", E.cy+1, E.rows.size());
+    int rlen = rstatus.size();
+
+    ewrite_with_len(lstatus, llen);
+    while (llen < E.screencols) {
+        if (E.screencols-llen == rlen) {
+            ewrite_with_len(rstatus, rlen);
+            break;
+        } else {
+            ewrite(" ");
+            llen++;
+        }
+    }
+
+    ewrite("\x1b[m");
+}
+
+void draw_cmdline() {
+    ewrite("\r\n");
+    ewrite("\x1b[K");
+    int len = (int)E.cmdline.size();
+    if (len > E.screencols) len = E.screencols;
+    if (len/* && time(NULL)-E.cmdline_msg_time < 2*/) {
+        ewrite_with_len(E.cmdline, len);
+    }
+    E.cmdline = "";
+}
+
+void draw_debug_info() {
+    ewrite("\r\n");
     std::string debug_info = fmt::format("cx: {}, cy = {}, rowoff: {}", E.cx, E.cy, E.rowoff);
     int len = debug_info.size();
     if (len > E.screencols) len = E.screencols;
@@ -324,6 +468,9 @@ void refresh_screen() {
     ewrite("\x1b[H");
 
     draw_rows();
+    draw_status_bar();
+    draw_cmdline();
+    draw_debug_info();
 
     char buf[32];
     usize len = snprintf(
@@ -331,7 +478,7 @@ void refresh_screen() {
         sizeof(buf)-1,
         "\x1b[%d;%dH",
         (E.cy-E.rowoff)+1,
-        (E.cx-E.coloff)+1);
+        (E.rx-E.coloff)+1);
     ewrite(std::string(buf, 0, len));
     ewrite("\x1b[?25h");
 
@@ -341,12 +488,14 @@ void refresh_screen() {
 void init_editor() {
     E.cx = 0;
     E.cy = 0;
+    E.rx = 0;
     E.rowoff = 0;
     E.coloff = 0;
     E.mode = NORMAL;
     if (get_window_size(&E.screenrows, &E.screencols) == -1)
         core::error_exit_from("get_window_size");
     E.abuf.reserve(5*1024);
+    E.cmdline_msg_time = 0;
 }
 
 int main(int argc, char** argv) {
@@ -355,6 +504,8 @@ int main(int argc, char** argv) {
     if (argc >= 2) {
         open_file(argv[1]);
     }
+
+    set_cmdline_msg("HELP: Ctrl-Q to quit");
 
     while (1) {
         refresh_screen();
