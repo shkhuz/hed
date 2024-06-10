@@ -29,9 +29,14 @@ typedef ssize_t isize;
 const int TAB_STOP = 4;
 const int NUM_FORCE_QUIT_PRESS = 3;
 
+bool str_startswith(const std::string& str, const std::string& startswith) {
+    return str.rfind(startswith, 0) == 0;
+}
+
 enum EditorMode {
     NORMAL,
     INSERT,
+    COMMAND,
 };
 
 enum EditorAction {
@@ -43,6 +48,7 @@ enum EditorAction {
     CURSOR_LINE_END,
     MODE_CHANGE_NORMAL,
     MODE_CHANGE_INSERT,
+    MODE_CHANGE_COMMAND,
     NEWLINE_INSERT,
     LEFT_CHAR_DELETE,
     FILE_SAVE,
@@ -51,10 +57,12 @@ enum EditorAction {
 
 enum EditorKey {
     BACKSPACE = 127,
+
     ARROW_LEFT = 1000,
     ARROW_RIGHT,
     ARROW_UP,
     ARROW_DOWN,
+    ALT_M,
 };
 
 struct EditorRow {
@@ -86,6 +94,8 @@ struct EditorConfig {
     std::string cmdline;
     time_t cmdline_msg_time;
     int quit_times;
+
+    std::ofstream keylog;
 
     int numrows() {
         return (int)rows.size();
@@ -155,6 +165,17 @@ int read_key() {
     while ((nread = read(STDIN_FILENO, buf, 64)) == 0);
     if (nread == -1 && errno != EAGAIN) core::error_exit_from("read");
 
+    for (int i = 0; i < nread; i++) {
+        switch (buf[i]) {
+            case '\x1b': E.keylog << "[esc]"; break;
+            case BACKSPACE: E.keylog << "[bksp]"; break;
+            case '\r': E.keylog << "[nl]"; break;
+            default: E.keylog << buf[i]; break;
+        }
+        E.keylog << ' ';
+    }
+    E.keylog << '\n';
+
     if (buf[0] == '\x1b' && nread == 1) {
         return '\x1b';
     } else if (nread > 1) {
@@ -164,6 +185,10 @@ int read_key() {
                 case 'B': return ARROW_DOWN;
                 case 'C': return ARROW_RIGHT;
                 case 'D': return ARROW_LEFT;
+            }
+        } else {
+            switch (buf[1]) {
+                case 'm': return ALT_M;
             }
         }
         return '\x1b';
@@ -424,13 +449,23 @@ void do_action(EditorAction a) {
         case CURSOR_LINE_BEGIN: E.cx = 0; break;
         case CURSOR_LINE_END: if (row) E.cx = row->len(); break;
 
-        case MODE_CHANGE_NORMAL: E.mode = NORMAL; break;
+        case MODE_CHANGE_NORMAL: {
+            E.mode = NORMAL;
+            E.cmdline = "";
+        } break;
+
         case MODE_CHANGE_INSERT: E.mode = INSERT; break;
+
+        case MODE_CHANGE_COMMAND: {
+            E.mode = COMMAND;
+            E.cmdline = "";
+        } break;
 
         case NEWLINE_INSERT: insert_newline(); break;
         case LEFT_CHAR_DELETE: delete_char(); break;
 
         case FILE_SAVE: save_file(); break;
+
         case EDITOR_EXIT: {
             if (E.dirty && E.quit_times > 0) {
                 set_cmdline_msg("File has unsaved changes: press C-Q {} more times to quit", E.quit_times);
@@ -485,6 +520,7 @@ void process_keypress() {
                 do_action(CURSOR_RIGHT);
                 do_action(LEFT_CHAR_DELETE);
                 break;
+            case ALT_M: do_action(MODE_CHANGE_COMMAND);
             case BACKSPACE: break;
             case '\r': break;
             case '\x1b': break;
@@ -505,6 +541,26 @@ void process_keypress() {
             default: {
                 if (c >= 32 && c <= 126) insert_char(c);
                 else set_cmdline_msg("non-printable key '{}' in insert mode", (int)c);
+            } break;
+        }
+
+    } else if (E.mode == COMMAND) {
+        switch (c) {
+            case '\r': {
+                std::string cmd = E.cmdline;
+                do_action(MODE_CHANGE_NORMAL);
+
+                if (cmd == "quit") do_action(EDITOR_EXIT);
+                else if (str_startswith(cmd, "path")) {
+                    E.path = cmd.substr(5);
+                }
+                else set_cmdline_msg("unknown command '{}'", cmd);
+            } break;
+
+            case '\x1b': do_action(MODE_CHANGE_NORMAL); break;
+
+            default: {
+                if (c >= 32 && c <= 126) E.cmdline += c;
             } break;
         }
     }
@@ -570,7 +626,7 @@ void draw_rows() {
 
 void draw_status_bar() {
     ewrite("\r\n");
-    if (E.mode == NORMAL) {
+    if (E.mode == NORMAL || E.mode == COMMAND) {
         ewrite("\x1b[1;47;30m");
     } else {
         ewrite("\x1b[1;44;30m");
@@ -579,7 +635,7 @@ void draw_status_bar() {
     std::string lstatus = fmt::format(
             "[{}{}] {:.20}",
             E.dirty ? '*' : '-',
-            E.mode == NORMAL ? 'N' : 'I',
+            E.mode == NORMAL || E.mode == COMMAND ? 'N' : 'I',
             E.path != "" ? E.path : "[No name]");
     int llen = lstatus.size();
     if (llen > E.screencols) llen = E.screencols;
@@ -604,12 +660,17 @@ void draw_status_bar() {
 void draw_cmdline() {
     ewrite("\r\n");
     ewrite("\x1b[K");
-    int len = (int)E.cmdline.size();
-    if (len > E.screencols) len = E.screencols;
-    if (len/* && time(NULL)-E.cmdline_msg_time < 2*/) {
-        ewrite_with_len(E.cmdline, len);
+    if (E.mode == COMMAND) {
+        ewrite(":");
+        ewrite(E.cmdline);
+    } else {
+        int len = (int)E.cmdline.size();
+        if (len > E.screencols) len = E.screencols;
+        if (len/* && time(NULL)-E.cmdline_msg_time < 2*/) {
+            ewrite_with_len(E.cmdline, len);
+        }
+        E.cmdline = "";
     }
-    E.cmdline = "";
 }
 
 void draw_debug_info() {
@@ -666,6 +727,8 @@ void init_editor() {
     E.abuf.reserve(5*1024);
     E.cmdline_msg_time = 0;
     E.quit_times = NUM_FORCE_QUIT_PRESS;
+    E.keylog = std::ofstream("key.txt", std::ios_base::app);
+    E.keylog << "\n============= new stream ==========\n";
 }
 
 int main(int argc, char** argv) {
