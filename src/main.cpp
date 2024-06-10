@@ -188,6 +188,7 @@ int get_window_size(int* rows, int* cols) {
 }
 
 int row_cx_to_rx(EditorRow* row, int cx) {
+    if (!row) return 0;
     int rx = 0;
     for (int i = 0; i < cx; i++) {
         if (row->data[i] == '\t') {
@@ -196,6 +197,23 @@ int row_cx_to_rx(EditorRow* row, int cx) {
         rx++;
     }
     return rx;
+}
+
+int row_rx_to_cx(EditorRow* row, int rx) {
+    if (!row) return 0;
+    int cx = 0;
+    for (int i = 0; i < rx; i++) {
+        if (cx > (row->len())) {
+            cx = row->len();
+            break;
+        }
+        if (row->data[cx] == '\t') {
+            i += (TAB_STOP-1) - (i%TAB_STOP);
+            if (i >= rx) break;
+        }
+        cx++;
+    }
+    return cx;
 }
 
 void update_row(EditorRow* row) {
@@ -269,6 +287,27 @@ void set_cmdline_msg(const std::string& fmt, Args... args) {
 void do_action(EditorAction a) {
     EditorRow* row = (E.cy >= (int)E.rows.size()) ? NULL : E.rows[E.cy];
     switch (a) {
+        case CURSOR_UP: {
+            if (E.cy != 0) E.cy--;
+            if (E.cy < (int)E.rows.size()) {
+                // We calculate E.cx from E.rx and update it
+                // instead of directly updating E.rx
+                // because E.rx is calculated on
+                // every refresh (throwing the prev value away).
+                // So we "choose" a E.cx which
+                // will be converted to the needed E.rx in the
+                // refresh stage.
+                E.cx = row_rx_to_cx(E.rows[E.cy], E.rx);
+            }
+        } break;
+
+        case CURSOR_DOWN: {
+            if (E.cy < (int)E.rows.size()) E.cy++;
+            if (E.cy < (int)E.rows.size()) {
+                E.cx = row_rx_to_cx(E.rows[E.cy], E.rx);
+            }
+        } break;
+
         case CURSOR_LEFT: {
             if (E.cx != 0) E.cx--;
             else if (E.cy > 0) {
@@ -276,6 +315,7 @@ void do_action(EditorAction a) {
                 E.cx = E.rows[E.cy]->len();
             }
         } break;
+
         case CURSOR_RIGHT: {
             if (row && E.cx < row->len()) E.cx++;
             else if (row && E.cx == row->len()) {
@@ -283,8 +323,7 @@ void do_action(EditorAction a) {
                 E.cx = 0;
             }
         } break;
-        case CURSOR_UP:    if (E.cy != 0) E.cy--; break;
-        case CURSOR_DOWN:  if (E.cy < (int)E.rows.size()) E.cy++; break;
+
         case CURSOR_LINE_BEGIN: E.cx = 0; break;
         case CURSOR_LINE_END: if (row) E.cx = row->len(); break;
 
@@ -292,6 +331,7 @@ void do_action(EditorAction a) {
         case MODE_CHANGE_INSERT: E.mode = INSERT; break;
 
         case EDITOR_EXIT:  core::succ_exit(); break;
+
         default: assert(0 && "do_action(): unknown action");
     }
 
@@ -454,7 +494,15 @@ void draw_cmdline() {
 
 void draw_debug_info() {
     ewrite("\r\n");
-    std::string debug_info = fmt::format("cx: {}, cy = {}, rowoff: {}", E.cx, E.cy, E.rowoff);
+    std::string debug_info = fmt::format(
+        "cx: {}, rx: {}, cx (calc): {}, cy = {}, rowoff: {}",
+        E.cx,
+        E.rx,
+        E.cy < (int)E.rows.size()
+            ? row_rx_to_cx(E.rows[E.cy], E.rx)
+            : row_rx_to_cx(NULL, E.rx),
+        E.cy,
+        E.rowoff);
     int len = debug_info.size();
     if (len > E.screencols) len = E.screencols;
     ewrite_with_len(debug_info, len);
