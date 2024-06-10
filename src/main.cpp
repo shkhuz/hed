@@ -27,6 +27,7 @@ typedef int64_t i64;
 typedef ssize_t isize;
 
 const int TAB_STOP = 4;
+const int NUM_FORCE_QUIT_PRESS = 3;
 
 enum EditorMode {
     NORMAL,
@@ -42,6 +43,9 @@ enum EditorAction {
     CURSOR_LINE_END,
     MODE_CHANGE_NORMAL,
     MODE_CHANGE_INSERT,
+    NEWLINE_INSERT,
+    LEFT_CHAR_DELETE,
+    FILE_SAVE,
     EDITOR_EXIT,
 };
 
@@ -74,12 +78,23 @@ struct EditorConfig {
     int coloff;
     EditorMode mode;
     std::string path;
+    bool dirty;
 
     termios ogtermios;
     std::string abuf;
     std::vector<EditorRow*> rows;
     std::string cmdline;
     time_t cmdline_msg_time;
+    int quit_times;
+
+    int numrows() {
+        return (int)rows.size();
+    }
+
+    EditorRow* get_row_at(int at) {
+        if (at < 0 || at >= numrows()) return NULL;
+        return rows[at];
+    }
 };
 EditorConfig E;
 
@@ -230,13 +245,27 @@ void update_row(EditorRow* row) {
         }
     }
     row->rdata.push_back('\0');
+    E.dirty = true;
 }
 
-void append_row(const std::string& data) {
+void insert_row(int at, const std::string& data) {
+    if (at < 0 || at > E.numrows()) return;
     EditorRow* row = new EditorRow();
     row->data = data;
-    E.rows.push_back(row);
+    E.rows.insert(E.rows.begin() + at, row);
     update_row(row);
+}
+
+void free_row(EditorRow* row) {
+    delete row;
+}
+
+void delete_row(int at) {
+    if (at < 0 || at > E.numrows()) return;
+    EditorRow* row = E.get_row_at(at);
+    free_row(row);
+    E.rows.erase(E.rows.begin() + at);
+    E.dirty = true;
 }
 
 void row_insert_char(EditorRow* row, int at, int c) {
@@ -245,15 +274,60 @@ void row_insert_char(EditorRow* row, int at, int c) {
     update_row(row);
 }
 
+void row_delete_char(EditorRow* row, int at) {
+    if (at < 0 || at >= row->len()) return;
+    row->data.erase(at, 1);
+    update_row(row);
+}
+
+void row_append_string(EditorRow* row, const std::string& str) {
+    row->data += str;
+    update_row(row);
+}
+
+template<typename... Args>
+void set_cmdline_msg(const std::string& fmt, Args... args) {
+    E.cmdline = fmt::format(fmt, args...);
+    E.cmdline_msg_time = time(NULL);
+}
+
+std::string rows_to_string() {
+    std::string res;
+    for (int i = 0; i < E.numrows(); i++) {
+        res.append(E.get_row_at(i)->data);
+        res.append("\n");
+    }
+    return res;
+}
+
+void save_file() {
+    if (E.path == "") {
+        set_cmdline_msg("no filename");
+        return;
+    }
+    std::string tmp_path = E.path + ".tmp";
+    std::ofstream f(tmp_path);
+    if (!f) set_cmdline_msg("cannot open file for saving");
+
+    std::string contents = rows_to_string();
+    f << contents;
+    f.close();
+    if (!f) set_cmdline_msg("cannot write to file for saving");
+    system(std::string("mv " + tmp_path + " " + E.path).c_str());
+    set_cmdline_msg("{} bytes written", contents.size());
+    E.dirty = false;
+}
+
 void open_file(const std::string& path) {
     std::ifstream f(path);
     std::string line;
 
     if (!f) core::error_exit_with_msg("file not found");
     while (std::getline(f, line)) {
-        append_row(line);
+        insert_row(E.numrows(), line);
     }
     E.path = path;
+    E.dirty = false;
 }
 
 // =========== high level ==============
@@ -271,25 +345,48 @@ void ewrite_with_len(const std::string& str, usize len) {
 }
 
 void insert_char(int c) {
-    if (E.cy == (int)E.rows.size()) {
-        append_row("");
+    if (E.cy == E.numrows()) {
+        insert_row(E.numrows(), "");
     }
-    row_insert_char(E.rows[E.cy], E.cx, c);
+    row_insert_char(E.get_row_at(E.cy), E.cx, c);
     E.cx++;
 }
 
-template<typename... Args>
-void set_cmdline_msg(const std::string& fmt, Args... args) {
-    E.cmdline = fmt::format(fmt, args...);
-    E.cmdline_msg_time = time(NULL);
+void insert_newline() {
+    if (E.cx == 0) {
+        insert_row(E.cy, "");
+    } else {
+        EditorRow* row = E.get_row_at(E.cy);
+        insert_row(E.cy+1, row->data.substr(E.cx, row->len()-E.cx));
+        row->data = row->data.substr(0, E.cx);
+        update_row(row);
+    }
+    E.cy++;
+    E.cx = 0;
+}
+
+void delete_char() {
+    if (E.cy == E.numrows()) return;
+    if (E.cx == 0 && E.cy == 0) return;
+
+    EditorRow* row = E.get_row_at(E.cy);
+    if (E.cx > 0) {
+        row_delete_char(row, E.cx-1);
+        E.cx--;
+    } else {
+        E.cx = E.get_row_at(E.cy-1)->len();
+        row_append_string(E.get_row_at(E.cy-1), row->data);
+        delete_row(E.cy);
+        E.cy--;
+    }
 }
 
 void do_action(EditorAction a) {
-    EditorRow* row = (E.cy >= (int)E.rows.size()) ? NULL : E.rows[E.cy];
+    EditorRow* row = E.get_row_at(E.cy);
     switch (a) {
         case CURSOR_UP: {
             if (E.cy != 0) E.cy--;
-            if (E.cy < (int)E.rows.size()) {
+            if (E.cy < E.numrows()) {
                 // We calculate E.cx from E.rx and update it
                 // instead of directly updating E.rx
                 // because E.rx is calculated on
@@ -297,14 +394,14 @@ void do_action(EditorAction a) {
                 // So we "choose" a E.cx which
                 // will be converted to the needed E.rx in the
                 // refresh stage.
-                E.cx = row_rx_to_cx(E.rows[E.cy], E.rx);
+                E.cx = row_rx_to_cx(E.get_row_at(E.cy), E.rx);
             }
         } break;
 
         case CURSOR_DOWN: {
-            if (E.cy < (int)E.rows.size()) E.cy++;
-            if (E.cy < (int)E.rows.size()) {
-                E.cx = row_rx_to_cx(E.rows[E.cy], E.rx);
+            if (E.cy < E.numrows()) E.cy++;
+            if (E.cy < E.numrows()) {
+                E.cx = row_rx_to_cx(E.get_row_at(E.cy), E.rx);
             }
         } break;
 
@@ -312,7 +409,7 @@ void do_action(EditorAction a) {
             if (E.cx != 0) E.cx--;
             else if (E.cy > 0) {
                 E.cy--;
-                E.cx = E.rows[E.cy]->len();
+                E.cx = E.get_row_at(E.cy)->len();
             }
         } break;
 
@@ -330,12 +427,24 @@ void do_action(EditorAction a) {
         case MODE_CHANGE_NORMAL: E.mode = NORMAL; break;
         case MODE_CHANGE_INSERT: E.mode = INSERT; break;
 
-        case EDITOR_EXIT:  core::succ_exit(); break;
+        case NEWLINE_INSERT: insert_newline(); break;
+        case LEFT_CHAR_DELETE: delete_char(); break;
+
+        case FILE_SAVE: save_file(); break;
+        case EDITOR_EXIT: {
+            if (E.dirty && E.quit_times > 0) {
+                set_cmdline_msg("File has unsaved changes: press C-Q {} more times to quit", E.quit_times);
+                E.quit_times--;
+            } else {
+                core::succ_exit();
+            }
+        } return; // Always return from EDITOR_EXIT
 
         default: assert(0 && "do_action(): unknown action");
     }
 
-    row = (E.cy >= (int)E.rows.size()) ? NULL : E.rows[E.cy];
+    E.quit_times = NUM_FORCE_QUIT_PRESS;
+    row = E.get_row_at(E.cy);
     int rowlen = row ? row->len() : 0;
     if (E.cx > rowlen) E.cx = rowlen;
 }
@@ -346,14 +455,15 @@ void process_keypress() {
         switch (c) {
             case 'i': do_action(MODE_CHANGE_INSERT); break;
             case CTRL_KEY('q'): do_action(EDITOR_EXIT); break;
+            case CTRL_KEY('s'): do_action(FILE_SAVE); break;
             case CTRL_KEY('d'):
             case CTRL_KEY('e'): {
                 if (c == CTRL_KEY('e')) {
                     E.cy = E.rowoff;
                 } else if (c == CTRL_KEY('d')) {
                     E.cy = E.rowoff + E.screenrows - 1;
-                    if (E.cy > (int)E.rows.size()) {
-                        E.cy = (int)E.rows.size();
+                    if (E.cy > E.numrows()) {
+                        E.cy = E.numrows();
                     }
                 }
 
@@ -371,6 +481,10 @@ void process_keypress() {
             case 'j': do_action(CURSOR_DOWN); break;
             case 'k': do_action(CURSOR_UP); break;
             case 'l': do_action(CURSOR_RIGHT); break;
+            case 'w':
+                do_action(CURSOR_RIGHT);
+                do_action(LEFT_CHAR_DELETE);
+                break;
             case BACKSPACE: break;
             case '\r': break;
             case '\x1b': break;
@@ -381,6 +495,12 @@ void process_keypress() {
 
     } else if (E.mode == INSERT) {
         switch (c) {
+            case BACKSPACE: do_action(LEFT_CHAR_DELETE); break;
+            case '\r':      do_action(NEWLINE_INSERT); break;
+            case ARROW_LEFT:  do_action(CURSOR_LEFT); break;
+            case ARROW_RIGHT: do_action(CURSOR_RIGHT); break;
+            case ARROW_UP:    do_action(CURSOR_UP); break;
+            case ARROW_DOWN:  do_action(CURSOR_DOWN); break;
             case '\x1b': do_action(MODE_CHANGE_NORMAL); break;
             default: {
                 if (c >= 32 && c <= 126) insert_char(c);
@@ -392,8 +512,8 @@ void process_keypress() {
 
 void scroll() {
     E.rx = 0;
-    if (E.cy < (int)E.rows.size()) {
-        E.rx = row_cx_to_rx(E.rows[E.cy], E.cx);
+    if (E.cy < E.numrows()) {
+        E.rx = row_cx_to_rx(E.get_row_at(E.cy), E.cx);
     }
 
     if (E.cy < E.rowoff) {
@@ -413,8 +533,8 @@ void scroll() {
 void draw_rows() {
     for (int y = 0; y < E.screenrows; y++) {
         int filerow = y + E.rowoff;
-        if (filerow >= (int)E.rows.size()) {
-            if (E.rows.size() == 0 && y == E.screenrows / 3) {
+        if (filerow >= E.numrows()) {
+            if (E.numrows() == 0 && y == E.screenrows / 3) {
                 std::string welcome = "Unnamed editor -- version 0.0.1";
                 usize len = welcome.size();
                 if (len > (usize)E.screencols) len = E.screencols;
@@ -435,10 +555,10 @@ void draw_rows() {
             }
 
         } else {
-            int rowlen = E.rows[filerow]->rlen() - E.coloff;
+            int rowlen = E.get_row_at(filerow)->rlen() - E.coloff;
             if (rowlen < 0) rowlen = 0;
             if (rowlen > E.screencols) rowlen = E.screencols;
-            ewrite_cstr_with_len(&E.rows[filerow]->rdata.data()[E.coloff], rowlen);
+            ewrite_cstr_with_len(&E.get_row_at(filerow)->rdata.data()[E.coloff], rowlen);
         }
 
         ewrite("\x1b[K");
@@ -457,14 +577,14 @@ void draw_status_bar() {
     }
 
     std::string lstatus = fmt::format(
-            "[{}]{:.20} - {} lines",
+            "[{}{}] {:.20}",
+            E.dirty ? '*' : '-',
             E.mode == NORMAL ? 'N' : 'I',
-            E.path != "" ? E.path : "[No name]",
-            E.rows.size());
+            E.path != "" ? E.path : "[No name]");
     int llen = lstatus.size();
     if (llen > E.screencols) llen = E.screencols;
 
-    std::string rstatus = fmt::format("{}/{}", E.cy+1, E.rows.size());
+    std::string rstatus = fmt::format("{}/{}", E.cy+1, E.numrows());
     int rlen = rstatus.size();
 
     ewrite_with_len(lstatus, llen);
@@ -498,8 +618,8 @@ void draw_debug_info() {
         "cx: {}, rx: {}, cx (calc): {}, cy = {}, rowoff: {}",
         E.cx,
         E.rx,
-        E.cy < (int)E.rows.size()
-            ? row_rx_to_cx(E.rows[E.cy], E.rx)
+        E.cy < E.numrows()
+            ? row_rx_to_cx(E.get_row_at(E.cy), E.rx)
             : row_rx_to_cx(NULL, E.rx),
         E.cy,
         E.rowoff);
@@ -540,10 +660,12 @@ void init_editor() {
     E.rowoff = 0;
     E.coloff = 0;
     E.mode = NORMAL;
+    E.dirty = false;
     if (get_window_size(&E.screenrows, &E.screencols) == -1)
         core::error_exit_from("get_window_size");
     E.abuf.reserve(5*1024);
     E.cmdline_msg_time = 0;
+    E.quit_times = NUM_FORCE_QUIT_PRESS;
 }
 
 int main(int argc, char** argv) {
@@ -553,7 +675,7 @@ int main(int argc, char** argv) {
         open_file(argv[1]);
     }
 
-    set_cmdline_msg("HELP: Ctrl-Q to quit");
+    set_cmdline_msg("HELP: Ctrl-S save, Ctrl-Q quit");
 
     while (1) {
         refresh_screen();
