@@ -33,10 +33,15 @@ bool str_startswith(const std::string& str, const std::string& startswith) {
     return str.rfind(startswith, 0) == 0;
 }
 
+bool is_char_printable(int c) {
+    return c >= 32 && c <= 126;
+}
+
 enum EditorMode {
     NORMAL,
     INSERT,
     COMMAND,
+    SEARCH,
 };
 
 enum EditorAction {
@@ -49,6 +54,7 @@ enum EditorAction {
     MODE_CHANGE_NORMAL,
     MODE_CHANGE_INSERT,
     MODE_CHANGE_COMMAND,
+    MODE_CHANGE_SEARCH,
     NEWLINE_INSERT,
     LEFT_CHAR_DELETE,
     FILE_SAVE,
@@ -63,6 +69,13 @@ enum EditorKey {
     ARROW_UP,
     ARROW_DOWN,
     ALT_M,
+
+    ALT_ARROW_LEFT,
+    ALT_ARROW_RIGHT,
+    ALT_ARROW_UP,
+    ALT_ARROW_DOWN,
+
+    UNKNOWN_KEY = -1,
 };
 
 struct EditorRow {
@@ -87,6 +100,7 @@ struct EditorConfig {
     EditorMode mode;
     std::string path;
     bool dirty;
+    int cmdx, cmdoff;
 
     termios ogtermios;
     std::string abuf;
@@ -94,11 +108,16 @@ struct EditorConfig {
     std::string cmdline;
     time_t cmdline_msg_time;
     int quit_times;
+    std::string search_default;
 
     std::ofstream keylog;
 
     int numrows() {
         return (int)rows.size();
+    }
+
+    int cmdline_len() {
+        return (int)cmdline.size();
     }
 
     EditorRow* get_row_at(int at) {
@@ -185,15 +204,32 @@ int read_key() {
                 case 'B': return ARROW_DOWN;
                 case 'C': return ARROW_RIGHT;
                 case 'D': return ARROW_LEFT;
+                case '1': {
+                    switch (buf[3]) {
+                        case ';': {
+                            switch (buf[4]) {
+                                case '3': {
+                                    switch (buf[5]) {
+                                        case 'A': return ALT_ARROW_UP;
+                                        case 'B': return ALT_ARROW_DOWN;
+                                        case 'C': return ALT_ARROW_RIGHT;
+                                        case 'D': return ALT_ARROW_LEFT;
+                                    }
+                                } break;
+                            }
+                        } break;
+                    }
+                } break;
             }
         } else {
             switch (buf[1]) {
                 case 'm': return ALT_M;
             }
         }
-        return '\x1b';
+    } else if (nread == 1) {
+        return buf[0];
     }
-    return buf[0];
+    return UNKNOWN_KEY;
 }
 
 int get_cursor_position(int* rows, int* cols) {
@@ -241,17 +277,14 @@ int row_cx_to_rx(EditorRow* row, int cx) {
 
 int row_rx_to_cx(EditorRow* row, int rx) {
     if (!row) return 0;
-    int cx = 0;
-    for (int i = 0; i < rx; i++) {
-        if (cx > (row->len())) {
-            cx = row->len();
-            break;
-        }
+    int cur_rx = 0;
+    int cx;
+    for (cx = 0; cx < row->len(); cx++) {
         if (row->data[cx] == '\t') {
-            i += (TAB_STOP-1) - (i%TAB_STOP);
-            if (i >= rx) break;
+            cur_rx += (TAB_STOP - 1) - (cur_rx % TAB_STOP);
         }
-        cx++;
+        cur_rx++;
+        if (cur_rx > rx) return cx;
     }
     return cx;
 }
@@ -355,6 +388,27 @@ void open_file(const std::string& path) {
     E.dirty = false;
 }
 
+void search_text(const std::string& query) {
+    if (query == "") return;
+    bool found = false;
+
+    for (int i = E.cy; i < E.numrows(); i++) {
+        EditorRow* row = E.rows[i];
+        usize match = row->rdata.find(query, (i == E.cy) ? E.rx+1 : 0);
+        if (match != std::string::npos) {
+            E.cy = i;
+            E.cx = row_rx_to_cx(row, match);
+            //E.rowoff = E.numrows();
+            found = true;
+            break;
+        }
+    }
+
+    if (!found) {
+        set_cmdline_msg("search reached EOF");
+    }
+}
+
 // =========== high level ==============
 
 void ewrite(const std::string& str) {
@@ -456,9 +510,12 @@ void do_action(EditorAction a) {
 
         case MODE_CHANGE_INSERT: E.mode = INSERT; break;
 
-        case MODE_CHANGE_COMMAND: {
-            E.mode = COMMAND;
+        case MODE_CHANGE_COMMAND:
+        case MODE_CHANGE_SEARCH: {
+            E.mode = (a == MODE_CHANGE_COMMAND) ? COMMAND : SEARCH;
             E.cmdline = "";
+            E.cmdx = 0;
+            E.cmdoff = 0;
         } break;
 
         case NEWLINE_INSERT: insert_newline(); break;
@@ -516,11 +573,19 @@ void process_keypress() {
             case 'j': do_action(CURSOR_DOWN); break;
             case 'k': do_action(CURSOR_UP); break;
             case 'l': do_action(CURSOR_RIGHT); break;
+            case '\'': {
+                if (E.search_default == "") {
+                    set_cmdline_msg("empty prev search");
+                } else {
+                    search_text(E.search_default);
+                }
+            } break;
             case 'w':
                 do_action(CURSOR_RIGHT);
                 do_action(LEFT_CHAR_DELETE);
                 break;
-            case ALT_M: do_action(MODE_CHANGE_COMMAND);
+            case ALT_M: do_action(MODE_CHANGE_COMMAND); break;
+            case '/': do_action(MODE_CHANGE_SEARCH); break;
             case BACKSPACE: break;
             case '\r': break;
             case '\x1b': break;
@@ -539,28 +604,59 @@ void process_keypress() {
             case ARROW_DOWN:  do_action(CURSOR_DOWN); break;
             case '\x1b': do_action(MODE_CHANGE_NORMAL); break;
             default: {
-                if (c >= 32 && c <= 126) insert_char(c);
+                if (is_char_printable(c)) insert_char(c);
                 else set_cmdline_msg("non-printable key '{}' in insert mode", (int)c);
             } break;
         }
 
-    } else if (E.mode == COMMAND) {
+    } else if (E.mode == COMMAND || E.mode == SEARCH) {
         switch (c) {
             case '\r': {
-                std::string cmd = E.cmdline;
+                std::string txt = E.cmdline;
+                EditorMode mode = E.mode;
                 do_action(MODE_CHANGE_NORMAL);
 
-                if (cmd == "quit") do_action(EDITOR_EXIT);
-                else if (str_startswith(cmd, "path")) {
-                    E.path = cmd.substr(5);
+                if (mode == COMMAND) {
+                    if (txt == "quit") do_action(EDITOR_EXIT);
+                    else if (str_startswith(txt, "path")) {
+                        E.path = txt.substr(5);
+                    }
+                    else set_cmdline_msg("unknown command '{}'", txt);
+                } else if (mode == SEARCH) {
+                    E.search_default = txt;
+                    search_text(txt);
                 }
-                else set_cmdline_msg("unknown command '{}'", cmd);
+            } break;
+
+            case BACKSPACE: {
+                if (E.cmdx > 0) {
+                    E.cmdline.erase(E.cmdx-1, 1);
+                    E.cmdx--;
+                }
+            } break;
+
+            case ARROW_LEFT:  if (E.cmdx > 0) E.cmdx--; break;
+            case ARROW_RIGHT: if (E.cmdx < E.cmdline_len()) E.cmdx++; break;
+
+            case ALT_ARROW_LEFT: {
+                E.cmdx = 0;
+            } break;
+
+            case ALT_ARROW_RIGHT: {
+                E.cmdx = E.cmdline_len();
             } break;
 
             case '\x1b': do_action(MODE_CHANGE_NORMAL); break;
 
             default: {
-                if (c >= 32 && c <= 126) E.cmdline += c;
+                if (is_char_printable(c)) {
+                    E.cmdline.insert(E.cmdx, 1, c);
+                    E.cmdx++;
+                }
+
+                if (E.mode == SEARCH) {
+
+                }
             } break;
         }
     }
@@ -583,6 +679,13 @@ void scroll() {
     }
     if (E.rx >= E.coloff + E.screencols) {
         E.coloff = E.rx - E.screencols + 1;
+    }
+
+    if (E.cmdx < E.cmdoff) {
+        E.cmdoff = E.cmdx;
+    }
+    if (E.cmdx >= E.cmdoff + (E.screencols-1)) {
+        E.cmdoff = E.cmdx - (E.screencols-1) + 1;
     }
 }
 
@@ -626,16 +729,16 @@ void draw_rows() {
 
 void draw_status_bar() {
     ewrite("\r\n");
-    if (E.mode == NORMAL || E.mode == COMMAND) {
-        ewrite("\x1b[1;47;30m");
-    } else {
+    if (E.mode == INSERT) {
         ewrite("\x1b[1;44;30m");
+    } else {
+        ewrite("\x1b[1;47;30m");
     }
 
     std::string lstatus = fmt::format(
             "[{}{}] {:.20}",
             E.dirty ? '*' : '-',
-            E.mode == NORMAL || E.mode == COMMAND ? 'N' : 'I',
+            E.mode == INSERT ? 'I' : 'N',
             E.path != "" ? E.path : "[No name]");
     int llen = lstatus.size();
     if (llen > E.screencols) llen = E.screencols;
@@ -660,11 +763,13 @@ void draw_status_bar() {
 void draw_cmdline() {
     ewrite("\r\n");
     ewrite("\x1b[K");
-    if (E.mode == COMMAND) {
+    if (E.mode == COMMAND || E.mode == SEARCH) {
         ewrite(":");
-        ewrite(E.cmdline);
+        int len = E.cmdline_len();
+        if (len > (E.screencols-1)) len = (E.screencols-1);
+        ewrite_cstr_with_len(&E.cmdline.data()[E.cmdoff], len);
     } else {
-        int len = (int)E.cmdline.size();
+        int len = E.cmdline_len();
         if (len > E.screencols) len = E.screencols;
         if (len/* && time(NULL)-E.cmdline_msg_time < 2*/) {
             ewrite_with_len(E.cmdline, len);
@@ -676,14 +781,12 @@ void draw_cmdline() {
 void draw_debug_info() {
     ewrite("\r\n");
     std::string debug_info = fmt::format(
-        "cx: {}, rx: {}, cx (calc): {}, cy = {}, rowoff: {}",
+        "cmdx: {}, cmdoff: {}, len(cmd): {}, cx = {}, cx (calc): {}",
+        E.cmdx,
+        E.cmdoff,
+        E.cmdline.size(),
         E.cx,
-        E.rx,
-        E.cy < E.numrows()
-            ? row_rx_to_cx(E.get_row_at(E.cy), E.rx)
-            : row_rx_to_cx(NULL, E.rx),
-        E.cy,
-        E.rowoff);
+        row_rx_to_cx(E.get_row_at(E.cy), E.rx));
     int len = debug_info.size();
     if (len > E.screencols) len = E.screencols;
     ewrite_with_len(debug_info, len);
@@ -702,12 +805,23 @@ void refresh_screen() {
     draw_debug_info();
 
     char buf[32];
-    usize len = snprintf(
-        buf,
-        sizeof(buf)-1,
-        "\x1b[%d;%dH",
-        (E.cy-E.rowoff)+1,
-        (E.rx-E.coloff)+1);
+    usize len;
+    if (E.mode == COMMAND || E.mode == SEARCH) {
+        len = snprintf(
+            buf,
+            sizeof(buf)-1,
+            "\x1b[%d;%dH",
+            // +2 makes it go from last row to cmdline
+            E.screenrows+2,
+            (E.cmdx-E.cmdoff)+2);
+    } else {
+        len = snprintf(
+            buf,
+            sizeof(buf)-1,
+            "\x1b[%d;%dH",
+            (E.cy-E.rowoff)+1,
+            (E.rx-E.coloff)+1);
+    }
     ewrite(std::string(buf, 0, len));
     ewrite("\x1b[?25h");
 
@@ -722,6 +836,8 @@ void init_editor() {
     E.coloff = 0;
     E.mode = NORMAL;
     E.dirty = false;
+    E.cmdx = 0;
+    E.cmdoff = 0;
     if (get_window_size(&E.screenrows, &E.screencols) == -1)
         core::error_exit_from("get_window_size");
     E.abuf.reserve(5*1024);
