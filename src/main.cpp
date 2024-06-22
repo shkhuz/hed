@@ -49,6 +49,8 @@ enum EditorAction {
     CURSOR_DOWN,
     CURSOR_LEFT,
     CURSOR_RIGHT,
+    CURSOR_FORWARD_WORD,
+    CURSOR_BACKWARD_WORD,
     CURSOR_LINE_BEGIN,
     CURSOR_LINE_END,
     MARK_SET,
@@ -59,6 +61,8 @@ enum EditorAction {
     MODE_CHANGE_SEARCH,
     NEWLINE_INSERT,
     LEFT_CHAR_DELETE,
+    CURRENT_CHAR_DELETE,
+    CLIPBOARD_PASTE,
     FILE_SAVE,
     EDITOR_EXIT,
 };
@@ -83,12 +87,6 @@ enum EditorKey {
 enum CmdlineStyle {
     NONE,
     ERROR,
-};
-
-enum ActionResult {
-    SUCCESS,
-    FAILURE,
-    NOP,
 };
 
 struct EditorRow {
@@ -134,7 +132,6 @@ struct EditorConfig {
     int screenrows;
     int screencols;
     int cx, cy, rx, tx;
-    int tmpcx, tmpcy, tmprx, tmptx;
     int mx, my;
     int rowoff;
     int coloff;
@@ -151,6 +148,7 @@ struct EditorConfig {
     CmdlineStyle cmdline_style;
     int quit_times;
     std::string search_default;
+    std::string clipboard;
 
     std::ofstream keylog;
 
@@ -173,18 +171,29 @@ struct EditorConfig {
         this->tx = row_cx_to_rx(get_row_at(cy), cx);
     }
 
-    void save_cursor_state() {
-        tmpcx = cx;
-        tmpcy = cy;
-        tmprx = rx;
-        tmptx = tx;
+    char get_char(int cx, int cy) {
+        if (cy >= numrows()) return '\0';
+        if (cx == get_row_at(cy)->len()) return '\n';
+        return get_row_at(cy)->data[cx];
     }
 
-    void restore_cursor_state() {
-        cx = tmpcx;
-        cy = tmpcy;
-        rx = tmprx;
-        tx = tmptx;
+    char get_char_at_cpos() {
+        return get_char(cx, cy);
+    }
+
+    char get_char_at_lpos() {
+        int x = cx, y = cy;
+        if (x == 0 && y == 0) return '\0';
+        if (x == 0) {
+            y--;
+            x = get_row_at(y)->len();
+        } else x--;
+        return get_char(x, y);
+    }
+
+    bool is_cpos_at_end() {
+        if (cy == numrows()) return true;
+        return false;
     }
 };
 EditorConfig E;
@@ -250,7 +259,9 @@ int read_key() {
         switch (buf[i]) {
             case '\x1b': E.keylog << "[esc]"; break;
             case BACKSPACE: E.keylog << "[bksp]"; break;
-            case '\r': E.keylog << "[nl]"; break;
+            case '\r': E.keylog << "[cr]"; break;
+            case '\n': E.keylog << "[nl]"; break;
+            case '\t': E.keylog << "[tab]"; break;
             default: E.keylog << buf[i]; break;
         }
         E.keylog << ' ';
@@ -304,7 +315,7 @@ int get_cursor_position(int* rows, int* cols) {
         if (buf[i] == 'R') break;
         i++;
     }
-    buf[i] = '\0';
+        buf[i] = '\0';
 
     if (buf[0] != '\x1b' || buf[1] != '[') return -1;
     if (sscanf(&buf[2], "%d;%d", rows, cols) != 2) return -1;
@@ -342,24 +353,27 @@ void update_row(EditorRow* row) {
     E.dirty = true;
 }
 
-void insert_row(int at, const std::string& data) {
-    if (at < 0 || at > E.numrows()) return;
+EditorRow* insert_row(int at, const std::string& data) {
+    if (at < 0 || at > E.numrows()) return NULL;
     EditorRow* row = new EditorRow();
     row->data = data;
     E.rows.insert(E.rows.begin() + at, row);
     update_row(row);
+    return row;
 }
 
 void free_row(EditorRow* row) {
     delete row;
 }
 
-void delete_row(int at) {
-    if (at < 0 || at > E.numrows()) return;
+std::string delete_row(int at) {
+    if (at < 0 || at >= E.numrows()) return "";
     EditorRow* row = E.get_row_at(at);
+    std::string rowdata = row->data;
     free_row(row);
     E.rows.erase(E.rows.begin() + at);
     E.dirty = true;
+    return rowdata;
 }
 
 void row_insert_char(EditorRow* row, int at, int c) {
@@ -368,10 +382,18 @@ void row_insert_char(EditorRow* row, int at, int c) {
     update_row(row);
 }
 
-void row_delete_range(EditorRow* row, int at, int len) {
-    if (at < 0 || at+len > row->len() || len == 0) return;
+void row_insert_string(EditorRow* row, int at, const std::string& str) {
+    if (at < 0 || at > row->len()) at = row->len();
+    row->data.insert(at, str);
+    update_row(row);
+}
+
+std::string row_delete_range(EditorRow* row, int at, int len) {
+    if (at < 0 || at+len > row->len() || len == 0) return "";
+    std::string copy = row->data.substr(at, len);
     row->data.erase(at, len);
     update_row(row);
+    return copy;
 }
 
 void row_append_string(EditorRow* row, const std::string& str) {
@@ -474,7 +496,38 @@ void search_text_backward(const std::string& query) {
     }
 }
 
+void copy_to_clipboard(const std::string& text) {
+    E.keylog << "[start]" << text << "[end]";
+    E.clipboard = text;
+}
+
+void paste_from_clipboard() {
+    usize sz = E.clipboard.size();
+    bool temp_row_inserted = false;
+    if (E.cy == E.numrows()) {
+        insert_row(E.cy, "");
+        temp_row_inserted = true;
+    }
+
+    EditorRow* row = E.get_row_at(E.cy);
+    for (usize i = 0; i < sz; i++) {
+        if (E.clipboard[i] == '\n') {
+            std::string leftover = row_delete_range(row, E.cx, row->len()-E.cx);
+            E.cy++;
+            E.cx = 0;
+            row = insert_row(E.cy, leftover);
+        } else {
+            row_insert_char(row, E.cx, E.clipboard[i]);
+            E.cx++;
+        }
+    }
+    if (temp_row_inserted) {
+        delete_row(E.cy);
+    }
+}
+
 // =========== high level ==============
+void do_action(EditorAction a);
 
 void ewrite(const std::string& str) {
     E.abuf.append(str);
@@ -508,28 +561,62 @@ void insert_newline() {
     E.set_cpos(0, E.cy+1);
 }
 
-ActionResult delete_char() {
-    if (E.cx == 0 && E.cy == 0) return NOP;
-
+void delete_left_char() {
+    if (E.cx == 0 && E.cy == 0) return;
     if (E.cy == E.numrows()) {
         E.set_cpos(E.get_row_at(E.cy-1)->len(), E.cy-1);
-    } else {
-        EditorRow* row = E.get_row_at(E.cy);
-        if (E.cx > 0) {
-            row_delete_range(row, E.cx-1, 1);
-            E.set_cpos(E.cx-1, E.cy);
-        } else {
-            E.set_cpos(E.get_row_at(E.cy-1)->len(), E.cy-1);
-            row_append_string(E.get_row_at(E.cy), row->data);
-            delete_row(E.cy+1);
-        }
+        return;
     }
-    return SUCCESS;
+
+    EditorRow* row = E.get_row_at(E.cy);
+    if (E.cx > 0) {
+        row_delete_range(row, E.cx-1, 1);
+        E.set_cpos(E.cx-1, E.cy);
+    } else {
+        E.set_cpos(E.get_row_at(E.cy-1)->len(), E.cy-1);
+        row_append_string(E.get_row_at(E.cy), row->data);
+        delete_row(E.cy+1);
+    }
 }
 
-ActionResult do_action(EditorAction a) {
+void delete_current_char() {
+    if (E.cy == E.numrows()) return;
     EditorRow* row = E.get_row_at(E.cy);
-    ActionResult result = SUCCESS;
+
+    if (row->len() == 0) {
+        delete_row(E.cy);
+        return;
+    }
+
+    if (E.cx == row->len()) {
+        if (E.cy < E.numrows()-1) {
+            row_append_string(row, E.get_row_at(E.cy+1)->data);
+            delete_row(E.cy+1);
+        }
+    } else {
+        row_delete_range(row, E.cx, 1);
+    }
+}
+
+void cursor_forward_word() {
+    while (!isalpha(E.get_char_at_cpos()) && !E.is_cpos_at_end())
+        do_action(CURSOR_RIGHT);
+    if (!E.is_cpos_at_end()) {
+        while (isalpha(E.get_char_at_cpos())) do_action(CURSOR_RIGHT);
+    }
+}
+
+void cursor_backward_word() {
+    if (E.cx == 0 && E.cy == 0) return;
+    while (!(isalpha(E.get_char_at_lpos()) || E.get_char_at_lpos() == '\0'))
+        do_action(CURSOR_LEFT);
+    while (isalpha(E.get_char_at_lpos())) {
+        do_action(CURSOR_LEFT);
+    }
+}
+
+void do_action(EditorAction a) {
+    EditorRow* row = E.get_row_at(E.cy);
     switch (a) {
         case CURSOR_UP: {
             if (E.cy != 0) E.cy--;
@@ -617,40 +704,72 @@ ActionResult do_action(EditorAction a) {
                 } else if (E.mx < E.cx) {
                     startx = E.mx;
                     endx = E.cx;
-                } else if (E.cx == E.mx) return NOP;
+                } else if (E.cx == E.mx) return;
             }
 
+            if (starty == E.numrows()) return;
+
+            std::string copy;
             if (starty == endy) {
-                row_delete_range(E.get_row_at(starty), startx, endx-startx);
+                copy += row_delete_range(E.get_row_at(starty), startx, endx-startx);
                 E.set_cpos(startx, E.cy);
             } else {
                 EditorRow* startrow = E.get_row_at(starty);
-                row_delete_range(startrow, startx, startrow->len()-startx);
-                row_append_string(
-                    startrow,
-                    E.get_row_at(endy)->data.substr(endx));
+                EditorRow* endrow = E.get_row_at(endy);
+                int numrows_before_action = E.numrows();
+                bool startrow_deleted = false;
 
-                for (int i = endy; i > starty; i--) {
-                    delete_row(i);
+                if (startx == 0) {
+                    copy += delete_row(starty);
+                    copy += "\n";
+                    startrow_deleted = true;
+                } else {
+                    copy += row_delete_range(startrow, startx, startrow->len()-startx);
+                }
+
+                for (int i = starty+1; i < endy; i++) {
+                    copy += "\n";
+                    copy += delete_row(startrow_deleted ? starty : starty+1);
+                }
+
+                if (endy < numrows_before_action) {
+                    if (startrow_deleted) {
+                        copy += "\n";
+                        copy += row_delete_range(endrow, 0, endx);
+                    } else {
+                        row_append_string(
+                            startrow,
+                            row_delete_range(endrow, endx, endrow->len()-endx));
+                        copy += "\n";
+                        copy += delete_row(starty+1);
+                    }
                 }
 
                 E.set_cpos(startx, starty);
             }
+
+            copy_to_clipboard(copy);
         } break;
 
+        case CURSOR_FORWARD_WORD: cursor_forward_word(); break;
+        case CURSOR_BACKWARD_WORD: cursor_backward_word(); break;
+
         case NEWLINE_INSERT: insert_newline(); break;
-        case LEFT_CHAR_DELETE: result = delete_char(); break;
+        case LEFT_CHAR_DELETE: delete_left_char(); break;
+        case CURRENT_CHAR_DELETE: delete_current_char(); break;
+
+        case CLIPBOARD_PASTE: paste_from_clipboard(); break;
 
         case FILE_SAVE: save_file(); break;
 
         case EDITOR_EXIT: {
             if (E.dirty && E.quit_times > 0) {
-                set_cmdline_msg_error("File has unsaved changes: press C-Q {} more times to quit", E.quit_times);
+                set_cmdline_msg_error("File has unsaved changes: press [backtick] {} more times to quit", E.quit_times);
                 E.quit_times--;
             } else {
                 core::succ_exit();
             }
-        } return result; // Always return from EDITOR_EXIT
+        } return; // Always return from EDITOR_EXIT
 
         default: assert(0 && "do_action(): unknown action");
     }
@@ -661,8 +780,6 @@ ActionResult do_action(EditorAction a) {
     if (E.cx > rowlen) {
         E.cx = rowlen;
     }
-
-    return result;
 }
 
 void process_keypress() {
@@ -670,13 +787,14 @@ void process_keypress() {
     if (E.mode == NORMAL) {
         switch (c) {
             case 'i': do_action(MODE_CHANGE_INSERT); break;
-            case CTRL_KEY('q'): do_action(EDITOR_EXIT); break;
+            case 'w': do_action(CURRENT_CHAR_DELETE); break;
+            case '`': do_action(EDITOR_EXIT); break;
             case CTRL_KEY('s'): do_action(FILE_SAVE); break;
-            case CTRL_KEY('d'):
-            case CTRL_KEY('e'): {
-                if (c == CTRL_KEY('e')) {
+            case CTRL_KEY('f'):
+            case CTRL_KEY('r'): {
+                if (c == CTRL_KEY('r')) {
                     E.cy = E.rowoff;
-                } else if (c == CTRL_KEY('d')) {
+                } else if (c == CTRL_KEY('f')) {
                     E.cy = E.rowoff + E.screenrows - 1;
                     if (E.cy > E.numrows()) {
                         E.cy = E.numrows();
@@ -685,7 +803,7 @@ void process_keypress() {
 
                 int times = E.screenrows;
                 while (times--)
-                    do_action(c == CTRL_KEY('e') ? CURSOR_UP : CURSOR_DOWN);
+                    do_action(c == CTRL_KEY('r') ? CURSOR_UP : CURSOR_DOWN);
             } break;
             case 'a': do_action(CURSOR_LINE_BEGIN); break;
             case ';': do_action(CURSOR_LINE_END); break;
@@ -698,8 +816,12 @@ void process_keypress() {
             case 'k': do_action(CURSOR_UP); break;
             case 'l': do_action(CURSOR_RIGHT); break;
 
+            case 'o': do_action(CURSOR_FORWARD_WORD); break;
+            case 'n': do_action(CURSOR_BACKWARD_WORD); break;
+
             case 'd': do_action(MARK_SET); break;
             case 'f': do_action(CURSOR_TO_MARK_CUT); break;
+            case 'c': do_action(CLIPBOARD_PASTE); break;
 
             case '\'': {
                 if (E.search_default == "") {
@@ -717,14 +839,6 @@ void process_keypress() {
                 }
             } break;
 
-            case 'w':
-                if (E.cy == E.numrows()) return;
-                E.save_cursor_state();
-                do_action(CURSOR_RIGHT);
-                if (do_action(LEFT_CHAR_DELETE) == NOP) {
-                    E.restore_cursor_state();
-                }
-                break;
             case ALT_M: do_action(MODE_CHANGE_COMMAND); break;
             case '/': do_action(MODE_CHANGE_SEARCH); break;
             case BACKSPACE: break;
@@ -982,10 +1096,6 @@ void init_editor() {
     E.cy = 0;
     E.rx = 0;
     E.tx = 0;
-    E.tmpcx = 0;
-    E.tmpcy = 0;
-    E.tmprx = 0;
-    E.tmptx = 0;
     E.mx = 0;
     E.my = 0;
     E.rowoff = 0;
@@ -1019,4 +1129,3 @@ int main(int argc, char** argv) {
 
     return 0;
 }
-
