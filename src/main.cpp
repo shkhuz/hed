@@ -27,15 +27,7 @@ typedef int64_t i64;
 typedef ssize_t isize;
 
 const int TAB_STOP = 4;
-const int NUM_FORCE_QUIT_PRESS = 3;
-
-bool str_startswith(const std::string& str, const std::string& startswith) {
-    return str.rfind(startswith, 0) == 0;
-}
-
-bool is_char_printable(int c) {
-    return c >= 32 && c <= 126;
-}
+const int NUM_FORCE_QUIT_PRESS = 2;
 
 enum EditorMode {
     NORMAL,
@@ -84,6 +76,11 @@ enum EditorKey {
     UNKNOWN_KEY = -1,
 };
 
+enum EditorHighlight {
+    HL_NORM = 0,
+    HL_NUM,
+};
+
 enum CmdlineStyle {
     NONE,
     ERROR,
@@ -92,6 +89,7 @@ enum CmdlineStyle {
 struct EditorRow {
     std::string data;
     std::string rdata;
+    std::vector<u8> hl;
 
     int len() {
         return (int)data.size();
@@ -139,6 +137,7 @@ struct EditorConfig {
     std::string path;
     bool dirty;
     int cmdx, cmdoff;
+    int hltsx, hltsy, hltex, hltey;
 
     termios ogtermios;
     std::string abuf;
@@ -198,6 +197,13 @@ struct EditorConfig {
     bool is_cpos_at_end() {
         if (cy == numrows()) return true;
         return false;
+    }
+
+    void reset_hlt() {
+        hltsx = 0;
+        hltsy = 0;
+        hltex = 0;
+        hltey = 0;
     }
 };
 EditorConfig E;
@@ -340,8 +346,51 @@ int get_window_size(int* rows, int* cols) {
     return 0;
 }
 
+int synhlt_to_color(EditorHighlight hl) {
+    switch (hl) {
+        case HL_NUM: return 31;
+        default: return 37;
+    }
+}
+
+bool str_startswith(const std::string& str, const std::string& startswith) {
+    return str.rfind(startswith, 0) == 0;
+}
+
+bool is_char_printable(int c) {
+    return c >= 32 && c <= 126;
+}
+
+bool is_char_separator(int c) {
+    return isspace(c) || c == '\0' || strchr(",.()+-/*=~%<>[];", c) != NULL;
+}
+
+void update_row_syntax(EditorRow* row) {
+    int rlen = row->rlen();
+    row->hl.reserve(rlen);
+    row->hl.clear();
+
+    bool prev_sep = true;
+    int i = 0;
+    while (i < rlen) {
+        char c = row->rdata[i];
+        EditorHighlight prev_hl = (i > 0) ? (EditorHighlight)row->hl[i-1] : HL_NORM;
+
+        if ((isdigit(c) && (prev_sep || prev_hl == HL_NUM)) || (c == '.' && prev_hl == HL_NUM)) {
+            row->hl.push_back(HL_NUM);
+            i++;
+            prev_sep = false;
+            continue;
+        } else {
+            row->hl.push_back(HL_NORM);
+        }
+        prev_sep = is_char_separator(c);
+        i++;
+    }
+}
+
 void update_row(EditorRow* row) {
-    row->rdata.reserve(100);
+    row->rdata.reserve(row->len());
     row->rdata.clear();
     for (int i = 0; i < row->len(); i++) {
         if (row->data[i] == '\t') {
@@ -355,6 +404,8 @@ void update_row(EditorRow* row) {
     }
     row->rdata.push_back('\0');
     E.dirty = true;
+
+    update_row_syntax(row);
 }
 
 EditorRow* insert_row(int at, const std::string& data) {
@@ -407,16 +458,20 @@ void row_append_string(EditorRow* row, const std::string& str) {
 
 template<typename... Args>
 void set_cmdline_msg_info(const std::string& fmt, Args... args) {
-    E.cmdline = fmt::format(fmt, args...);
-    E.cmdline_msg_time = time(NULL);
-    E.cmdline_style = NONE;
+    if (E.mode != COMMAND && E.mode != SEARCH) {
+        E.cmdline = fmt::format(fmt, args...);
+        E.cmdline_msg_time = time(NULL);
+        E.cmdline_style = NONE;
+    }
 }
 
 template<typename... Args>
 void set_cmdline_msg_error(const std::string& fmt, Args... args) {
-    E.cmdline = fmt::format(fmt, args...);
-    E.cmdline_msg_time = time(NULL);
-    E.cmdline_style = ERROR;
+    if (E.mode != COMMAND && E.mode != SEARCH) {
+        E.cmdline = fmt::format(fmt, args...);
+        E.cmdline_msg_time = time(NULL);
+        E.cmdline_style = ERROR;
+    }
 }
 
 std::string rows_to_string() {
@@ -458,16 +513,23 @@ void open_file(const std::string& path) {
     E.dirty = false;
 }
 
-void search_text_forward(const std::string& query) {
-    if (query == "") return;
+void search_text_forward(const std::string& query, bool set_cursor_on_match) {
+    if (query == "") {
+        E.reset_hlt();
+        return;
+    }
     bool found = false;
 
     for (int i = E.cy; i < E.numrows(); i++) {
         EditorRow* row = E.rows[i];
         usize match = row->rdata.find(query, (i == E.cy) ? E.rx+1 : 0);
         if (match != std::string::npos) {
-            E.set_cpos(row_rx_to_cx(row, match), i);
+            if (set_cursor_on_match) E.set_cpos(row_rx_to_cx(row, match), i);
             //E.rowoff = E.numrows();
+            E.hltsy = i;
+            E.hltsx = match;
+            E.hltey = i;
+            E.hltex = match + query.size();
             found = true;
             break;
         }
@@ -475,11 +537,15 @@ void search_text_forward(const std::string& query) {
 
     if (!found) {
         set_cmdline_msg_error("search reached EOF");
+        E.reset_hlt();
     }
 }
 
-void search_text_backward(const std::string& query) {
-    if (query == "") return;
+void search_text_backward(const std::string& query, bool set_cursor_on_match) {
+    if (query == "") {
+        E.reset_hlt();
+        return;
+    }
     bool found = false;
 
     for (int i = E.cy; i >= 0; i--) {
@@ -488,8 +554,12 @@ void search_text_backward(const std::string& query) {
         EditorRow* row = E.rows[i];
         usize match = row->rdata.rfind(query, (i == E.cy) ? E.rx-1 : std::string::npos);
         if (match != std::string::npos) {
-            E.set_cpos(row_rx_to_cx(row, match), i);
+            if (set_cursor_on_match) E.set_cpos(row_rx_to_cx(row, match), i);
             //E.rowoff = E.numrows();
+            E.hltsy = i;
+            E.hltsx = match;
+            E.hltey = i;
+            E.hltex = match + query.size();
             found = true;
             break;
         }
@@ -497,6 +567,7 @@ void search_text_backward(const std::string& query) {
 
     if (!found) {
         set_cmdline_msg_error("search reached BOF");
+        E.reset_hlt();
     }
 }
 
@@ -572,6 +643,7 @@ void delete_left_char() {
 
 void delete_current_char() {
     EditorRow* row = E.get_row_at(E.cy);
+    if (!row) return;
 
     if (E.cx == row->len()) {
         if (E.cy < E.lastrow_idx()) {
@@ -780,6 +852,7 @@ void do_action(EditorAction a) {
     if (E.cx > rowlen) {
         E.cx = rowlen;
     }
+    E.reset_hlt();
 }
 
 void process_keypress() {
@@ -823,19 +896,19 @@ void process_keypress() {
             case 'f': do_action(CURSOR_TO_MARK_CUT); break;
             case 'c': do_action(CLIPBOARD_PASTE); break;
 
-            case '\'': {
+            case 'b': {
                 if (E.search_default == "") {
                     set_cmdline_msg_error("empty prev search");
                 } else {
-                    search_text_forward(E.search_default);
+                    search_text_forward(E.search_default, true);
                 }
             } break;
 
-            case '"': {
+            case 'B': {
                 if (E.search_default == "") {
                     set_cmdline_msg_error("empty prev search");
                 } else {
-                    search_text_backward(E.search_default);
+                    search_text_backward(E.search_default, true);
                 }
             } break;
 
@@ -880,7 +953,7 @@ void process_keypress() {
                     else set_cmdline_msg_error("unknown command '{}'", txt);
                 } else if (mode == SEARCH) {
                     E.search_default = txt;
-                    search_text_forward(txt);
+                    search_text_forward(txt, true);
                 }
             } break;
 
@@ -888,6 +961,10 @@ void process_keypress() {
                 if (E.cmdx > 0) {
                     E.cmdline.erase(E.cmdx-1, 1);
                     E.cmdx--;
+                }
+
+                if (E.mode == SEARCH) {
+                    search_text_forward(E.cmdline, false);
                 }
             } break;
 
@@ -911,6 +988,7 @@ void process_keypress() {
                 }
 
                 if (E.mode == SEARCH) {
+                    search_text_forward(E.cmdline, false);
                 }
             } break;
         }
@@ -949,7 +1027,7 @@ void draw_rows() {
         int filerow = y + E.rowoff;
         if (filerow >= E.numrows()) {
             if (E.numrows() == 0 && y == E.screenrows / 3) {
-                std::string welcome = "Unnamed editor -- version 0.0.1";
+                std::string welcome = "Unnamed editor -- maintained by shkhuz";
                 usize len = welcome.size();
                 if (len > (usize)E.screencols) len = E.screencols;
 
@@ -972,7 +1050,36 @@ void draw_rows() {
             int rowlen = E.get_row_at(filerow)->rlen() - E.coloff;
             if (rowlen < 0) rowlen = 0;
             if (rowlen > E.screencols) rowlen = E.screencols;
-            ewrite_cstr_with_len(&E.get_row_at(filerow)->rdata.data()[E.coloff], rowlen);
+
+            char* c = &E.get_row_at(filerow)->rdata.data()[E.coloff];
+            u8* hl = &E.get_row_at(filerow)->hl.data()[E.coloff];
+            int current_color = -1;
+
+            for (int i = 0; i < rowlen; i++) {
+                int filei = i + E.coloff;
+                if (filerow == E.hltsy && filei == E.hltsx) {
+                    ewrite("\x1b[44m");
+                }
+                if (filerow == E.hltey && filei == E.hltex) {
+                    ewrite("\x1b[49m");
+                }
+
+                if (hl[i] == HL_NORM) {
+                    if (current_color != -1) {
+                        ewrite("\x1b[39m");
+                        current_color = -1;
+                    }
+                    ewrite_cstr_with_len(&c[i], 1);
+                } else {
+                    int color = synhlt_to_color((EditorHighlight)hl[i]);
+                    if (color != current_color) {
+                        current_color = color;
+                        ewrite(fmt::format("\x1b[{}m", color));
+                    }
+                    ewrite_cstr_with_len(&c[i], 1);
+                }
+            }
+            ewrite("\x1b[39m");
         }
 
         ewrite("\x1b[K");
@@ -1105,6 +1212,7 @@ void init_editor() {
     E.dirty = false;
     E.cmdx = 0;
     E.cmdoff = 0;
+    E.reset_hlt();
     if (get_window_size(&E.screenrows, &E.screencols) == -1)
         core::error_exit_from("get_window_size");
     E.abuf.reserve(5*1024);
