@@ -67,6 +67,7 @@ enum EditorKey {
     ARROW_UP,
     ARROW_DOWN,
     ALT_M,
+    ALT_S,
 
     ALT_ARROW_LEFT,
     ALT_ARROW_RIGHT,
@@ -76,10 +77,100 @@ enum EditorKey {
     UNKNOWN_KEY = -1,
 };
 
-enum EditorHighlight {
-    HL_NORM = 0,
-    HL_NUM,
+#define EDSYN_HLT_NUMBER (1<<0)
+#define EDSYN_HLT_STRING (1<<1)
+
+struct EditorSyntax {
+    std::string filetype;
+    std::string* extmatch;
+    std::string* keywords;
+    std::string* types;
+    std::string* consts;
+    std::string singleline_comment_start;
+    int flags;
 };
+
+std::string C_EXTS[] = {"c", "h", "cpp", ""};
+std::string C_KEYWORDS[] = {
+    "switch",
+    "if",
+    "while",
+    "for",
+    "break",
+    "continue",
+    "return",
+    "else",
+    "struct",
+    "union",
+    "typedef",
+    "static",
+    "enum",
+    "class",
+    "using",
+    "namespace",
+    "case",
+    "const",
+    "#include",
+    "#pragma",
+    "#define",
+    "#if",
+    "#ifdef",
+    "#ifndef",
+    "#elif",
+    "#endif",
+    "",
+};
+std::string C_TYPES[] = {
+    "void",
+    "char",
+    "bool",
+    "int",
+    "long",
+    "float",
+    "double",
+    "",
+};
+std::string C_CONSTS[] = {
+    "true",
+    "false",
+    "NULL",
+    "",
+};
+
+EditorSyntax HLDB[] = {
+    {
+        "c",
+        C_EXTS,
+        C_KEYWORDS,
+        C_TYPES,
+        C_CONSTS,
+        "//",
+        EDSYN_HLT_NUMBER | EDSYN_HLT_STRING
+    },
+};
+#define NUM_HLDBS (sizeof(HLDB) / sizeof(HLDB[0]))
+
+enum EditorHighlight {
+    HL_NORMAL = 0,
+    HL_NUMBER,
+    HL_STRING,
+    HL_COMMENT,
+    HL_KEYWORD,
+    HL_TYPE,
+    HL_CONST,
+};
+
+int hl_to_color(EditorHighlight hl) {
+    switch (hl) {
+        case HL_NUMBER: return 31;
+        case HL_STRING: return 35;
+        case HL_COMMENT: return 35;
+        case HL_KEYWORD: return 32;
+        case HL_TYPE: return 33;
+        case HL_CONST: return 35;
+        default: return 37;
+    }
+}
 
 enum CmdlineStyle {
     NONE,
@@ -89,14 +180,11 @@ enum CmdlineStyle {
 struct EditorRow {
     std::string data;
     std::string rdata;
-    std::vector<u8> hl;
+    int rlen;
+    u8* hl;
 
     int len() {
         return (int)data.size();
-    }
-
-    int rlen() {
-        return (int)rdata.size();
     }
 };
 
@@ -138,6 +226,7 @@ struct EditorConfig {
     bool dirty;
     int cmdx, cmdoff;
     int hltsx, hltsy, hltex, hltey;
+    EditorSyntax* syn;
 
     termios ogtermios;
     std::string abuf;
@@ -307,6 +396,7 @@ int read_key() {
         } else {
             switch (buf[1]) {
                 case 'm': return ALT_M;
+                case 's': return ALT_S;
             }
         }
     } else if (nread == 1) {
@@ -346,13 +436,6 @@ int get_window_size(int* rows, int* cols) {
     return 0;
 }
 
-int synhlt_to_color(EditorHighlight hl) {
-    switch (hl) {
-        case HL_NUM: return 31;
-        default: return 37;
-    }
-}
-
 bool str_startswith(const std::string& str, const std::string& startswith) {
     return str.rfind(startswith, 0) == 0;
 }
@@ -365,25 +448,95 @@ bool is_char_separator(int c) {
     return isspace(c) || c == '\0' || strchr(",.()+-/*=~%<>[];", c) != NULL;
 }
 
+bool match_syn_word(std::string* wordlist, EditorRow* row, int* i, EditorHighlight hl) {
+    bool found = false;
+    for (int j = 0; wordlist[j] != ""; j++) {
+        int klen = wordlist[j].size();
+        if (!strncmp(&row->rdata[*i], wordlist[j].c_str(), klen) &&
+            is_char_separator(row->rdata[*i+klen])) {
+            memset(&row->hl[*i], hl, klen);
+            *i += klen;
+            found = true;
+            break;
+        }
+    }
+    return found;
+}
+
 void update_row_syntax(EditorRow* row) {
-    int rlen = row->rlen();
-    row->hl.reserve(rlen);
-    row->hl.clear();
+    int rlen = row->rlen;
+    row->hl = (u8*)realloc(row->hl, rlen);
+    memset(row->hl, HL_NORMAL, rlen);
+
+    if (E.syn == NULL) return;
+
+    std::string* keywords = E.syn->keywords;
+    std::string* types = E.syn->types;
+    std::string* consts = E.syn->consts;
+
+    std::string scs = E.syn->singleline_comment_start;
 
     bool prev_sep = true;
+    int which_string = 0;
     int i = 0;
+
     while (i < rlen) {
         char c = row->rdata[i];
-        EditorHighlight prev_hl = (i > 0) ? (EditorHighlight)row->hl[i-1] : HL_NORM;
+        EditorHighlight prev_hl = (i > 0) ? (EditorHighlight)row->hl[i-1] : HL_NORMAL;
 
-        if ((isdigit(c) && (prev_sep || prev_hl == HL_NUM)) || (c == '.' && prev_hl == HL_NUM)) {
-            row->hl.push_back(HL_NUM);
-            i++;
-            prev_sep = false;
-            continue;
-        } else {
-            row->hl.push_back(HL_NORM);
+        if (scs.size() && !which_string) {
+            if (!strncmp(&row->rdata[i], scs.c_str(), scs.size())) {
+                memset(&row->hl[i], HL_COMMENT, rlen-i);
+                break;
+            }
         }
+
+        if (E.syn->flags & EDSYN_HLT_STRING) {
+            if (which_string) {
+                row->hl[i] = HL_STRING;
+                if (c == '\\' && i+1 < rlen) {
+                    row->hl[i+1] = HL_STRING;
+                    i += 2;
+                    continue;
+                }
+                if (c == which_string) which_string = 0;
+                i++;
+                prev_sep = 1;
+                continue;
+            } else {
+                if ((c == '"' || c == '\'')) {
+                    which_string = c;
+                    row->hl[i] = HL_STRING;
+                    i++;
+                    continue;
+                }
+            }
+        }
+
+        if (E.syn->flags & EDSYN_HLT_NUMBER) {
+            if ((isdigit(c) && (prev_sep || prev_hl == HL_NUMBER)) || (c == '.' && prev_hl == HL_NUMBER)) {
+                row->hl[i] = HL_NUMBER;
+                i++;
+                prev_sep = false;
+                continue;
+            }
+        }
+
+        if (prev_sep) {
+            bool found = match_syn_word(keywords, row, &i, HL_KEYWORD);
+            if (!found) {
+                found = match_syn_word(types, row, &i, HL_TYPE);
+                if (!found) {
+                    found = match_syn_word(consts, row, &i, HL_CONST);
+                }
+            }
+
+            if (found) {
+                prev_sep = 0;
+                continue;
+            }
+        }
+
         prev_sep = is_char_separator(c);
         i++;
     }
@@ -395,13 +548,16 @@ void update_row(EditorRow* row) {
     for (int i = 0; i < row->len(); i++) {
         if (row->data[i] == '\t') {
             row->rdata.push_back(' ');
-            while (row->rlen() % TAB_STOP != 0) {
+            while (row->rdata.size() % TAB_STOP != 0) {
                 row->rdata.push_back(' ');
             }
         } else {
             row->rdata.push_back(row->data[i]);
         }
     }
+
+    // Compute size before adding '\0'
+    row->rlen = row->rdata.size();
     row->rdata.push_back('\0');
     E.dirty = true;
 
@@ -412,12 +568,14 @@ EditorRow* insert_row(int at, const std::string& data) {
     if (at < 0 || at > E.numrows()) return NULL;
     EditorRow* row = new EditorRow();
     row->data = data;
+    row->hl = NULL;
     E.rows.insert(E.rows.begin() + at, row);
     update_row(row);
     return row;
 }
 
 void free_row(EditorRow* row) {
+    free(row->hl);
     delete row;
 }
 
@@ -483,6 +641,58 @@ std::string rows_to_string() {
     return res;
 }
 
+void _find_synhlt_with_ext() {
+    E.syn = NULL;
+    if (E.path == "") return;
+    usize idx = E.path.find('.');
+    if (idx == std::string::npos) return;
+    std::string ext = E.path.substr(idx+1);
+    if (ext == "") return;
+
+    for (usize i = 0; i < NUM_HLDBS; i++) {
+        EditorSyntax* s = &HLDB[i];
+        int e = 0;
+        std::string need = s->extmatch[e];
+        while (need != "") {
+            if (need == ext) {
+                E.syn = s;
+                return;
+            }
+            e++;
+            need = s->extmatch[e];
+        }
+    }
+}
+
+void update_synhlt_from_ext() {
+    _find_synhlt_with_ext();
+    for (int r = 0; r < E.numrows(); r++) {
+        update_row_syntax(E.get_row_at(r));
+    }
+}
+
+void scroll_to(int x, int y) {
+    if (y < E.rowoff) {
+        E.rowoff = y;
+    }
+    if (y >= E.rowoff + E.screenrows) {
+        E.rowoff = y - E.screenrows + 1;
+    }
+    if (x < E.coloff) {
+        E.coloff = x;
+    }
+    if (x >= E.coloff + E.screencols) {
+        E.coloff = x - E.screencols + 1;
+    }
+
+    if (E.cmdx < E.cmdoff) {
+        E.cmdoff = E.cmdx;
+    }
+    if (E.cmdx >= E.cmdoff + (E.screencols-1)) {
+        E.cmdoff = E.cmdx - (E.screencols-1) + 1;
+    }
+}
+
 void save_file() {
     if (E.path == "") {
         set_cmdline_msg_info("no filename");
@@ -501,6 +711,11 @@ void save_file() {
     E.dirty = false;
 }
 
+void set_path(const std::string& path) {
+    E.path = path;
+    update_synhlt_from_ext();
+}
+
 void open_file(const std::string& path) {
     std::ifstream f(path);
     std::string line;
@@ -509,7 +724,7 @@ void open_file(const std::string& path) {
     while (std::getline(f, line)) {
         insert_row(E.numrows(), line);
     }
-    E.path = path;
+    set_path(path);
     E.dirty = false;
 }
 
@@ -525,11 +740,11 @@ void search_text_forward(const std::string& query, bool set_cursor_on_match) {
         usize match = row->rdata.find(query, (i == E.cy) ? E.rx+1 : 0);
         if (match != std::string::npos) {
             if (set_cursor_on_match) E.set_cpos(row_rx_to_cx(row, match), i);
-            //E.rowoff = E.numrows();
             E.hltsy = i;
             E.hltsx = match;
             E.hltey = i;
             E.hltex = match + query.size();
+            scroll_to(match + query.size(), i);
             found = true;
             break;
         }
@@ -560,6 +775,7 @@ void search_text_backward(const std::string& query, bool set_cursor_on_match) {
             E.hltsx = match;
             E.hltey = i;
             E.hltex = match + query.size();
+            scroll_to(match + query.size(), i);
             found = true;
             break;
         }
@@ -576,6 +792,10 @@ void do_action(EditorAction a);
 
 void ewrite(const std::string& str) {
     E.abuf.append(str);
+}
+
+void ewrite_char(char c) {
+    E.abuf += c;
 }
 
 void ewrite_cstr_with_len(const char* str, usize len) {
@@ -862,15 +1082,14 @@ void process_keypress() {
             case 'i': do_action(MODE_CHANGE_INSERT); break;
             case 'w': do_action(CURRENT_CHAR_DELETE); break;
             case '`': do_action(EDITOR_EXIT); break;
-            case CTRL_KEY('s'): do_action(FILE_SAVE); break;
             case CTRL_KEY('f'):
             case CTRL_KEY('r'): {
                 if (c == CTRL_KEY('r')) {
-                    E.set_cpos(E.cx, E.rowoff);
+                    E.cy = E.rowoff;
                 } else if (c == CTRL_KEY('f')) {
-                    E.set_cpos(E.cx, E.rowoff + E.screenrows - 1);
+                    E.cy = E.rowoff + E.screenrows - 1;
                     if (E.cy > E.lastrow_idx()) {
-                        E.set_cpos(E.cx, E.lastrow_idx());
+                        E.cy = E.lastrow_idx();
                     }
                 }
 
@@ -913,6 +1132,7 @@ void process_keypress() {
             } break;
 
             case ALT_M: do_action(MODE_CHANGE_COMMAND); break;
+            case ALT_S: do_action(FILE_SAVE); break;
             case '/': do_action(MODE_CHANGE_SEARCH); break;
             case BACKSPACE: break;
             case '\r': break;
@@ -948,7 +1168,7 @@ void process_keypress() {
                 if (mode == COMMAND) {
                     if (txt == "quit") do_action(EDITOR_EXIT);
                     else if (str_startswith(txt, "path")) {
-                        E.path = txt.substr(5);
+                        set_path(txt.substr(5));
                     }
                     else set_cmdline_msg_error("unknown command '{}'", txt);
                 } else if (mode == SEARCH) {
@@ -995,30 +1215,10 @@ void process_keypress() {
     }
 }
 
-void scroll() {
+void update_rx() {
     E.rx = 0;
     if (E.cy < E.numrows()) {
         E.rx = row_cx_to_rx(E.get_row_at(E.cy), E.cx);
-    }
-
-    if (E.cy < E.rowoff) {
-        E.rowoff = E.cy;
-    }
-    if (E.cy >= E.rowoff + E.screenrows) {
-        E.rowoff = E.cy - E.screenrows + 1;
-    }
-    if (E.rx < E.coloff) {
-        E.coloff = E.rx;
-    }
-    if (E.rx >= E.coloff + E.screencols) {
-        E.coloff = E.rx - E.screencols + 1;
-    }
-
-    if (E.cmdx < E.cmdoff) {
-        E.cmdoff = E.cmdx;
-    }
-    if (E.cmdx >= E.cmdoff + (E.screencols-1)) {
-        E.cmdoff = E.cmdx - (E.screencols-1) + 1;
     }
 }
 
@@ -1047,12 +1247,12 @@ void draw_rows() {
             }
 
         } else {
-            int rowlen = E.get_row_at(filerow)->rlen() - E.coloff;
+            int rowlen = E.get_row_at(filerow)->rlen - E.coloff;
             if (rowlen < 0) rowlen = 0;
             if (rowlen > E.screencols) rowlen = E.screencols;
 
             char* c = &E.get_row_at(filerow)->rdata.data()[E.coloff];
-            u8* hl = &E.get_row_at(filerow)->hl.data()[E.coloff];
+            u8* hl = &E.get_row_at(filerow)->hl[E.coloff];
             int current_color = -1;
 
             for (int i = 0; i < rowlen; i++) {
@@ -1064,14 +1264,22 @@ void draw_rows() {
                     ewrite("\x1b[49m");
                 }
 
-                if (hl[i] == HL_NORM) {
+                if (iscntrl(c[i])) {
+                    char sym = (c[i] <= 26) ? '@'+c[i] : '?';
+                    ewrite("\x1b[7m");
+                    ewrite_char(sym);
+                    ewrite("\x1b[m");
+                    if (current_color != -1) {
+                        ewrite(fmt::format("\x1b[{}m", current_color));
+                    }
+                } else if (hl[i] == HL_NORMAL) {
                     if (current_color != -1) {
                         ewrite("\x1b[39m");
                         current_color = -1;
                     }
                     ewrite_cstr_with_len(&c[i], 1);
                 } else {
-                    int color = synhlt_to_color((EditorHighlight)hl[i]);
+                    int color = hl_to_color((EditorHighlight)hl[i]);
                     if (color != current_color) {
                         current_color = color;
                         ewrite(fmt::format("\x1b[{}m", color));
@@ -1105,7 +1313,11 @@ void draw_status_bar() {
     int llen = lstatus.size();
     if (llen > E.screencols) llen = E.screencols;
 
-    std::string rstatus = fmt::format("{}/{}", E.cy+1, E.numrows());
+    std::string rstatus = fmt::format(
+        "{} {}/{}",
+        E.syn ? E.syn->filetype : "none",
+        E.cy+1,
+        E.numrows());
     int rlen = rstatus.size();
 
     ewrite_with_len(lstatus, llen);
@@ -1165,7 +1377,11 @@ void draw_debug_info() {
 }
 
 void refresh_screen() {
-    scroll();
+    if (E.mode != COMMAND && E.mode != SEARCH) {
+        update_rx();
+        scroll_to(E.rx, E.cy);
+    }
+
     E.abuf.clear();
     ewrite("\x1b[?25l");
     ewrite("\x1b[H");
@@ -1212,6 +1428,7 @@ void init_editor() {
     E.dirty = false;
     E.cmdx = 0;
     E.cmdoff = 0;
+    E.syn = NULL;
     E.reset_hlt();
     if (get_window_size(&E.screenrows, &E.screencols) == -1)
         core::error_exit_from("get_window_size");

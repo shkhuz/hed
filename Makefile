@@ -6,12 +6,14 @@ OBJS := $(addprefix build/obj/, $(addsuffix .o, $(SRCS)))
 
 INCLUDES := -Ithirdparty
 LIBS := 
-FLAGS := -g -O0 -Wall -Wextra -Wno-unused-parameter -D_DEBUG
+FLAGS := -g -O0 -Wall -Wextra -Wno-unused-parameter -Wno-write-strings
+ifdef d
+	FLAGS += -D_DEBUG
+endif
 
 CC := g++
 
 run: $(OBJS) build/a.out
-	#./build/a.out test_file.txt
 	./build/a.out Makefile
 
 debug: $(OBJS) build/a.out
@@ -30,6 +32,9 @@ build/obj/%.cc.o: %.cc
 
 clean:
 	rm -rf build/
+
+clean-our:
+	rm -rf build/obj/src/main.cpp.o
 
 .PHONY: clean run debug
 

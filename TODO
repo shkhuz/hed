@@ -1,2 +1,0 @@
-Handle left char delete and current char delete separately so that
-EOF special cases are handled
