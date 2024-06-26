@@ -5,7 +5,7 @@ SRCS := \
 OBJS := $(addprefix build/obj/, $(addsuffix .o, $(SRCS)))
 
 INCLUDES := -Ithirdparty
-LIBS := 
+LIBS := -Lbuild/clip -lclip
 FLAGS := -g -O0 -Wall -Wextra -Wno-unused-parameter -Wno-write-strings
 ifdef d
 	FLAGS += -D_DEBUG
@@ -13,14 +13,18 @@ endif
 
 CC := g++
 
-run: $(OBJS) build/a.out
+run: build/a.out
 	./build/a.out Makefile
 
-debug: $(OBJS) build/a.out
+debug: build/a.out
 	gdb --args ./build/a.out Makefile
 
-build/a.out: $(OBJS)
+build/a.out: $(OBJS) build/clip/libclip.a
 	$(CC) -o build/a.out $(FLAGS) $(OBJS) $(LIBS)
+
+build/clip/libclip.a:
+	@mkdir -p $(dir $@)
+	cd build/clip; cmake ../../thirdparty/clip && make
 
 build/obj/%.cpp.o: %.cpp
 	@mkdir -p $(dir $@)
