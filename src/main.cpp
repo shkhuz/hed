@@ -897,9 +897,10 @@ void copy_to_clipboard(const std::string& text) {
 }
 
 void paste_from_clipboard() {
-    usize sz = E.clipboard.size();
+    const std::string& clip = E.clipboard;
+    usize sz = clip.size();
     for (usize i = 0; i < sz; i++) {
-        insert_char(E.clipboard[i]);
+        insert_char(clip[i]);
     }
 }
 

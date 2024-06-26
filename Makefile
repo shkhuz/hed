@@ -4,7 +4,7 @@ SRCS := \
 OBJS := $(addprefix build/obj/, $(addsuffix .o, $(SRCS)))
 
 INCLUDES := -Ithirdparty/fmt/include
-LIBS := -Lbuild/fmt -Lbuild/clip -lfmt -lclip
+LIBS := -Lbuild/fmt -lfmt 
 FLAGS := -g -O0 -Wall -Wextra -Wno-unused-parameter -Wno-write-strings
 ifdef d
 	FLAGS += -D_DEBUG
@@ -18,12 +18,8 @@ run: build/a.out
 debug: build/a.out
 	gdb --args ./build/a.out Makefile
 
-build/a.out: $(OBJS) build/fmt/libfmt.a build/clip/libclip.a
+build/a.out: $(OBJS) build/fmt/libfmt.a
 	$(CC) -o build/a.out $(FLAGS) $(OBJS) $(LIBS)
-
-build/clip/libclip.a:
-	@mkdir -p $(dir $@)
-	cd build/clip; cmake ../../thirdparty/clip && make clip
 
 build/fmt/libfmt.a:
 	@mkdir -p $(dir $@)
