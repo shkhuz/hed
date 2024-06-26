@@ -45,6 +45,8 @@ enum EditorAction {
     CURSOR_BACKWARD_WORD,
     CURSOR_LINE_BEGIN,
     CURSOR_LINE_END,
+    CURSOR_FILE_TOP,
+    CURSOR_FILE_BOTTOM,
     MARK_SET,
     CURSOR_TO_MARK_CUT,
     MODE_CHANGE_NORMAL,
@@ -110,6 +112,12 @@ std::string C_KEYWORDS[] = {
     "namespace",
     "case",
     "const",
+    "inline",
+    "auto",
+    "constexpr",
+    "template",
+    "typename",
+    "const",
     "#include",
     "#pragma",
     "#define",
@@ -124,7 +132,11 @@ std::string C_TYPES[] = {
     "void",
     "char",
     "bool",
+    "short",
     "int",
+    "size_t",
+    "ssize_t",
+    "ptrdiff_t",
     "long",
     "float",
     "double",
@@ -675,16 +687,18 @@ void scroll_to(int x, int y) {
     if (y < E.rowoff) {
         E.rowoff = y;
     }
-    if (y >= E.rowoff + E.screenrows) {
-        E.rowoff = y - E.screenrows + 1;
+    if (y >= E.rowoff + (E.screenrows-5)) {
+        E.rowoff = y - (E.screenrows-5) + 1;
     }
     if (x < E.coloff) {
         E.coloff = x;
     }
-    if (x >= E.coloff + E.screencols) {
-        E.coloff = x - E.screencols + 1;
+    if (x >= E.coloff + (E.screencols-5)) {
+        E.coloff = x - (E.screencols-5) + 1;
     }
+}
 
+void scroll_cmdline() {
     if (E.cmdx < E.cmdoff) {
         E.cmdoff = E.cmdx;
     }
@@ -971,28 +985,30 @@ void cursor_backward_word() {
     }
 }
 
+void update_cx_when_cy_changed() {
+    if (E.numrows() != 0) {
+        // We calculate E.cx from E.rx and update it
+        // instead of directly updating E.rx
+        // because E.rx is calculated on
+        // every refresh (throwing the prev value away).
+        // So we "choose" a E.cx which
+        // will be converted to the needed E.rx in the
+        // refresh stage.
+        E.cx = row_rx_to_cx(E.get_row_at(E.cy), E.tx > E.rx ? E.tx : E.rx);
+    }
+}
+
 void do_action(EditorAction a) {
     EditorRow* row = E.get_row_at(E.cy);
     switch (a) {
         case CURSOR_UP: {
             if (E.cy != 0) E.cy--;
-            if (E.cy < E.numrows()) {
-                // We calculate E.cx from E.rx and update it
-                // instead of directly updating E.rx
-                // because E.rx is calculated on
-                // every refresh (throwing the prev value away).
-                // So we "choose" a E.cx which
-                // will be converted to the needed E.rx in the
-                // refresh stage.
-                E.cx = row_rx_to_cx(E.get_row_at(E.cy), E.tx > E.rx ? E.tx : E.rx);
-            }
+            update_cx_when_cy_changed();
         } break;
 
         case CURSOR_DOWN: {
             if (E.cy < E.lastrow_idx()) E.cy++;
-            if (E.cy < E.numrows()) {
-                E.cx = row_rx_to_cx(E.get_row_at(E.cy), E.tx > E.rx ? E.tx : E.rx);
-            }
+            update_cx_when_cy_changed();
         } break;
 
         case CURSOR_LEFT: {
@@ -1046,6 +1062,15 @@ void do_action(EditorAction a) {
         case CURSOR_FORWARD_WORD: cursor_forward_word(); break;
         case CURSOR_BACKWARD_WORD: cursor_backward_word(); break;
 
+        case CURSOR_FILE_TOP: {
+            E.cy = 0;
+            update_cx_when_cy_changed();
+        } break;
+        case CURSOR_FILE_BOTTOM: {
+            E.cy = E.lastrow_idx();
+            update_cx_when_cy_changed();
+        } break;
+
         case NEWLINE_INSERT: insert_newline(); break;
         case LEFT_CHAR_DELETE: delete_left_char(); break;
         case CURRENT_CHAR_DELETE: delete_current_char(); break;
@@ -1092,6 +1117,7 @@ void process_keypress() {
                         E.cy = E.lastrow_idx();
                     }
                 }
+                update_cx_when_cy_changed();
 
                 int times = E.screenrows;
                 while (times--)
@@ -1137,6 +1163,26 @@ void process_keypress() {
             case BACKSPACE: break;
             case '\r': break;
             case '\x1b': break;
+
+            case 'g': {
+                c = read_key();
+                switch (c) {
+                    case 'k': {
+                        do_action(CURSOR_FILE_TOP);
+                    } break;
+
+                    case 'j': {
+                        do_action(CURSOR_FILE_BOTTOM);
+                    } break;
+
+                    case '\x1b': break;
+
+                    default: {
+                        set_cmdline_msg_error("invalid key 'g {}' in normal mode", (int)c);
+                    } break;
+                }
+            } break;
+
             default: {
                 set_cmdline_msg_error("invalid key '{}' in normal mode", (int)c);
             } break;
@@ -1181,6 +1227,8 @@ void process_keypress() {
                 if (E.cmdx > 0) {
                     E.cmdline.erase(E.cmdx-1, 1);
                     E.cmdx--;
+                } else if (E.cmdx == 0 && E.cmdline.size() == 0) {
+                    do_action(MODE_CHANGE_NORMAL);
                 }
 
                 if (E.mode == SEARCH) {
@@ -1188,8 +1236,8 @@ void process_keypress() {
                 }
             } break;
 
-            case ARROW_LEFT:  if (E.cmdx > 0) E.cmdx--; break;
-            case ARROW_RIGHT: if (E.cmdx < E.cmdline_len()) E.cmdx++; break;
+            case CTRL_KEY('h'):  if (E.cmdx > 0) E.cmdx--; break;
+            case CTRL_KEY('l'): if (E.cmdx < E.cmdline_len()) E.cmdx++; break;
 
             case ALT_ARROW_LEFT: {
                 E.cmdx = 0;
@@ -1255,7 +1303,12 @@ void draw_rows() {
             u8* hl = &E.get_row_at(filerow)->hl[E.coloff];
             int current_color = -1;
 
-            for (int i = 0; i < rowlen; i++) {
+            // We go till i == rowlen because hlt end is exclusive
+            // so we need to one after the last character to check if
+            // hlt is ended.
+            // But we exit early before printing because there is
+            // no character at i == rowlen.
+            for (int i = 0; i <= rowlen; i++) {
                 int filei = i + E.coloff;
                 if (filerow == E.hltsy && filei == E.hltsx) {
                     ewrite("\x1b[44m");
@@ -1263,6 +1316,7 @@ void draw_rows() {
                 if (filerow == E.hltey && filei == E.hltex) {
                     ewrite("\x1b[49m");
                 }
+                if (i == rowlen) break;
 
                 if (iscntrl(c[i])) {
                     char sym = (c[i] <= 26) ? '@'+c[i] : '?';
@@ -1381,6 +1435,7 @@ void refresh_screen() {
         update_rx();
         scroll_to(E.rx, E.cy);
     }
+    scroll_cmdline();
 
     E.abuf.clear();
     ewrite("\x1b[?25l");
