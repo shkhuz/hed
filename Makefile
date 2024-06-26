@@ -12,14 +12,14 @@ endif
 
 CC := g++
 
-run: build/a.out
-	./build/a.out Makefile
+run: build/hed
+	./build/hed tabtest.txt
 
-debug: build/a.out
-	gdb --args ./build/a.out Makefile
+debug: build/hed
+	gdb --args ./build/hed tabtest.txt
 
-build/a.out: $(OBJS) build/fmt/libfmt.a
-	$(CC) -o build/a.out $(FLAGS) $(OBJS) $(LIBS)
+build/hed: $(OBJS) build/fmt/libfmt.a
+	$(CC) -o build/hed $(FLAGS) $(OBJS) $(LIBS)
 
 build/fmt/libfmt.a:
 	@mkdir -p $(dir $@)

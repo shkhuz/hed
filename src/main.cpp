@@ -626,6 +626,16 @@ void row_append_string(EditorRow* row, const std::string& str) {
     update_row(row);
 }
 
+int row_get_indent(EditorRow* row) {
+    int indent = 0;
+    while (indent < row->len() && row->data[indent] == '\t') indent++;
+    return indent;
+}
+
+void row_indent(EditorRow* row) {
+    row_insert_char(row, 0, '\t');
+}
+
 template<typename... Args>
 void set_cmdline_msg_info(const std::string& fmt, Args... args) {
     if (E.mode != COMMAND && E.mode != SEARCH) {
@@ -707,7 +717,21 @@ void scroll_cmdline() {
     }
 }
 
+const char* WHITESPACE = " \t\n\r\f\v";
+
+void str_trim_trailing_ws(std::string& s) {
+    s.erase(s.find_last_not_of(WHITESPACE)+1);
+}
+
+void file_trim_trailing_ws() {
+    for (int i = 0; i < E.numrows(); i++) {
+        str_trim_trailing_ws(E.get_row_at(i)->data);
+    }
+}
+
 void save_file() {
+    file_trim_trailing_ws();
+
     if (E.path == "") {
         set_cmdline_msg_info("no filename");
         return;
@@ -826,6 +850,34 @@ void insert_empty_row_if_file_empty() {
     }
 }
 
+void row_indent_to_prev_indent(EditorRow* row_to_indent) {
+    int target_indent = 0;
+    bool found_indent = false;
+
+    int cy = E.cy-1;
+    for (int i = cy; i >= 0; i--) {
+        EditorRow* row = E.get_row_at(i);
+        if (row->len() == 0) continue;
+        int cx = row->len();
+
+        for (; cx >= 0; cx--) {
+            if (row->data[cx] != '\t' && row->data[cx] != ' ') {
+                target_indent = row_get_indent(row);
+                found_indent = true;
+                break;
+            }
+        }
+
+        if (found_indent) break;
+    }
+
+    int indent_by = target_indent - row_get_indent(row_to_indent);
+    for (int i = 0; i < indent_by; i++) {
+        row_indent(row_to_indent);
+        E.set_cpos(E.cx+1, E.cy);
+    }
+}
+
 void insert_newline() {
     insert_empty_row_if_file_empty();
 
@@ -838,6 +890,7 @@ void insert_newline() {
         update_row(row);
     }
     E.set_cpos(0, E.cy+1);
+    row_indent_to_prev_indent(E.get_row_at(E.cy));
 }
 
 void insert_char(int c) {
@@ -1138,6 +1191,13 @@ void process_keypress() {
             case 'o': do_action(CURSOR_FORWARD_WORD); break;
             case 'n': do_action(CURSOR_BACKWARD_WORD); break;
 
+            case ',': {
+                insert_row(E.cy+1, "");
+                E.set_cpos(0, E.cy+1);
+                row_indent_to_prev_indent(E.get_row_at(E.cy));
+                do_action(MODE_CHANGE_INSERT);
+            } break;
+
             case 'd': do_action(MARK_SET); break;
             case 'f': do_action(CURSOR_TO_MARK_CUT); break;
             case 'c': do_action(CLIPBOARD_PASTE); break;
@@ -1276,7 +1336,7 @@ void draw_rows() {
         int filerow = y + E.rowoff;
         if (filerow >= E.numrows()) {
             if (E.numrows() == 0 && y == E.screenrows / 3) {
-                std::string welcome = "Unnamed editor -- maintained by shkhuz";
+                std::string welcome = "hed editor -- maintained by shkhuz";
                 usize len = welcome.size();
                 if (len > (usize)E.screencols) len = E.screencols;
 
