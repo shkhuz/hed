@@ -4,7 +4,7 @@ SRCS := \
 OBJS := $(addprefix build/obj/, $(addsuffix .o, $(SRCS)))
 
 INCLUDES := -Ithirdparty/fmt/include
-LIBS := -Lbuild/fmt -lfmt 
+LIBS := -Lbuild/fmt -lfmt
 FLAGS := -g -O0 -Wall -Wextra -Wno-unused-parameter -Wno-write-strings
 ifdef d
 	FLAGS += -D_DEBUG

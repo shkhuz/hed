@@ -969,7 +969,7 @@ void delete_cursor_to_mark() {
         endy = E.my;
         startx = E.cx;
         endx = E.mx;
-    } else if (E.my == E.cy) {
+    } else {
         starty = E.cy;
         endy = E.cy;
         if (E.cx < E.mx) {
@@ -978,7 +978,7 @@ void delete_cursor_to_mark() {
         } else if (E.mx < E.cx) {
             startx = E.mx;
             endx = E.cx;
-        } else if (E.cx == E.mx) return;
+        } else return;
     }
 
     std::string copy;
