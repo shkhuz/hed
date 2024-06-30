@@ -296,7 +296,7 @@ struct EditorConfig {
     }
 
     bool is_cpos_at_end() {
-        if (cy == numrows()) return true;
+        if (cy == lastrow_idx() && cx == get_row_at(cy)->len()) return true;
         return false;
     }
 
@@ -592,7 +592,7 @@ void free_row(EditorRow* row) {
 }
 
 std::string delete_row(int at) {
-    if (at < 0 || at >= E.numrows()) return "";
+        if (at < 0 || at >= E.numrows()) return "";
     EditorRow* row = E.get_row_at(at);
     std::string rowdata = row->data;
     free_row(row);
@@ -630,6 +630,15 @@ int row_get_indent(EditorRow* row) {
     int indent = 0;
     while (indent < row->len() && row->data[indent] == '\t') indent++;
     return indent;
+}
+
+void row_set_indent(EditorRow* row, int indent) {
+    int current_indent = row_get_indent(row);
+    row_delete_range(row, 0, current_indent);
+
+    for (int i = 0; i < indent; i++) {
+        row_insert_char(row, 0, '\t');
+    }
 }
 
 void row_indent(EditorRow* row) {
@@ -872,13 +881,13 @@ void row_indent_to_prev_indent(EditorRow* row_to_indent) {
     }
 
     int indent_by = target_indent - row_get_indent(row_to_indent);
-    for (int i = 0; i < indent_by; i++) {
-        row_indent(row_to_indent);
-        E.set_cpos(E.cx+1, E.cy);
+    if (indent_by > 0) {
+        row_set_indent(row_to_indent, indent_by);
+        E.set_cpos(E.cx+indent_by, E.cy);
     }
 }
 
-void insert_newline() {
+void insert_newline(bool autoindent) {
     insert_empty_row_if_file_empty();
 
     if (E.cx == 0) {
@@ -890,12 +899,12 @@ void insert_newline() {
         update_row(row);
     }
     E.set_cpos(0, E.cy+1);
-    row_indent_to_prev_indent(E.get_row_at(E.cy));
+    if (autoindent) row_indent_to_prev_indent(E.get_row_at(E.cy));
 }
 
 void insert_char(int c) {
     if (c == '\n') {
-        insert_newline();
+        insert_newline(false);
         return;
     }
 
@@ -1125,7 +1134,7 @@ void do_action(EditorAction a) {
             update_cx_when_cy_changed();
         } break;
 
-        case NEWLINE_INSERT: insert_newline(); break;
+        case NEWLINE_INSERT: insert_newline(true); break;
         case LEFT_CHAR_DELETE: delete_left_char(); break;
         case CURRENT_CHAR_DELETE: delete_current_char(); break;
 
@@ -1562,7 +1571,7 @@ int main(int argc, char** argv) {
         open_file(argv[1]);
     }
 
-    set_cmdline_msg_info("HELP: Ctrl-S save, Ctrl-Q quit");
+    set_cmdline_msg_info("HELP: Alt-s save, ` quit");
 
     while (1) {
         refresh_screen();

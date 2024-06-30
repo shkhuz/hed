@@ -1,5 +1,6 @@
-SRC :=
-	main.cpp
-
-clean:
-
+int main() {
+	printf("hello world!");
+	if (false) {
+		exit();
+	}
+}
