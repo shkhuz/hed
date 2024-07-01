@@ -641,10 +641,6 @@ void row_set_indent(EditorRow* row, int indent) {
     }
 }
 
-void row_indent(EditorRow* row) {
-    row_insert_char(row, 0, '\t');
-}
-
 template<typename... Args>
 void set_cmdline_msg_info(const std::string& fmt, Args... args) {
     if (E.mode != COMMAND && E.mode != SEARCH) {
@@ -738,26 +734,6 @@ void file_trim_trailing_ws() {
     }
 }
 
-void save_file() {
-    file_trim_trailing_ws();
-
-    if (E.path == "") {
-        set_cmdline_msg_info("no filename");
-        return;
-    }
-    std::string tmp_path = E.path + ".tmp";
-    std::ofstream f(tmp_path);
-    if (!f) set_cmdline_msg_error("cannot open file for saving");
-
-    std::string contents = rows_to_string();
-    f << contents;
-    f.close();
-    if (!f) set_cmdline_msg_error("cannot write to file for saving");
-    system(std::string("mv " + tmp_path + " " + E.path).c_str());
-    set_cmdline_msg_info("{} bytes written", contents.size());
-    E.dirty = false;
-}
-
 void set_path(const std::string& path) {
     E.path = path;
     update_synhlt_from_ext();
@@ -817,7 +793,6 @@ void search_text_backward(const std::string& query, bool set_cursor_on_match) {
         usize match = row->rdata.rfind(query, (i == E.cy) ? E.rx-1 : std::string::npos);
         if (match != std::string::npos) {
             if (set_cursor_on_match) E.set_cpos(row_rx_to_cx(row, match), i);
-            //E.rowoff = E.numrows();
             E.hltsy = i;
             E.hltsx = match;
             E.hltey = i;
@@ -835,8 +810,6 @@ void search_text_backward(const std::string& query, bool set_cursor_on_match) {
 }
 
 // =========== high level ==============
-void do_action(EditorAction a);
-
 void ewrite(const std::string& str) {
     E.abuf.append(str);
 }
@@ -887,33 +860,6 @@ void row_indent_to_prev_indent(EditorRow* row_to_indent) {
     }
 }
 
-void insert_newline(bool autoindent) {
-    insert_empty_row_if_file_empty();
-
-    if (E.cx == 0) {
-        insert_row(E.cy, "");
-    } else {
-        EditorRow* row = E.get_row_at(E.cy);
-        insert_row(E.cy+1, row->data.substr(E.cx, row->len()-E.cx));
-        row->data = row->data.substr(0, E.cx);
-        update_row(row);
-    }
-    E.set_cpos(0, E.cy+1);
-    if (autoindent) row_indent_to_prev_indent(E.get_row_at(E.cy));
-}
-
-void insert_char(int c) {
-    if (c == '\n') {
-        insert_newline(false);
-        return;
-    }
-
-    insert_empty_row_if_file_empty();
-
-    row_insert_char(E.get_row_at(E.cy), E.cx, c);
-    E.set_cpos(E.cx+1, E.cy);
-}
-
 void delete_empty_row_if_file_empty() {
     EditorRow* row = E.get_row_at(E.cy);
     if (E.numrows() == 1 && row->len() == 0) {
@@ -921,36 +867,17 @@ void delete_empty_row_if_file_empty() {
     }
 }
 
-void delete_left_char() {
-    if (E.cx == 0 && E.cy == 0) return;
-    EditorRow* row = E.get_row_at(E.cy);
-
-    if (E.cx > 0) {
-        row_delete_range(row, E.cx-1, 1);
-        E.set_cpos(E.cx-1, E.cy);
-    } else {
-        E.set_cpos(E.get_row_at(E.cy-1)->len(), E.cy-1);
-        row_append_string(E.get_row_at(E.cy), row->data);
-        delete_row(E.cy+1);
+void update_cx_when_cy_changed() {
+    if (E.numrows() != 0) {
+        // We calculate E.cx from E.rx and update it
+        // instead of directly updating E.rx
+        // because E.rx is calculated on
+        // every refresh (throwing the prev value away).
+        // So we "choose" a E.cx which
+        // will be converted to the needed E.rx in the
+        // refresh stage.
+        E.cx = row_rx_to_cx(E.get_row_at(E.cy), E.tx > E.rx ? E.tx : E.rx);
     }
-
-    delete_empty_row_if_file_empty();
-}
-
-void delete_current_char() {
-    EditorRow* row = E.get_row_at(E.cy);
-    if (!row) return;
-
-    if (E.cx == row->len()) {
-        if (E.cy < E.lastrow_idx()) {
-            row_append_string(row, E.get_row_at(E.cy+1)->data);
-            delete_row(E.cy+1);
-        }
-    } else {
-        row_delete_range(row, E.cx, 1);
-    }
-
-    delete_empty_row_if_file_empty();
 }
 
 void copy_to_clipboard(const std::string& text) {
@@ -958,15 +885,72 @@ void copy_to_clipboard(const std::string& text) {
     E.clipboard = text;
 }
 
-void paste_from_clipboard() {
-    const std::string& clip = E.clipboard;
-    usize sz = clip.size();
-    for (usize i = 0; i < sz; i++) {
-        insert_char(clip[i]);
+// ============= ACTIONS ==============
+
+void do_cursor_up() {
+    if (E.cy != 0) E.cy--;
+    update_cx_when_cy_changed();
+}
+
+void do_cursor_down() {
+    if (E.cy < E.lastrow_idx()) E.cy++;
+    update_cx_when_cy_changed();
+}
+
+void do_cursor_left() {
+    if (E.cx != 0) E.set_cpos(E.cx-1, E.cy);
+    else if (E.cy > 0) {
+        E.set_cpos(E.get_row_at(E.cy-1)->len(), E.cy-1);
     }
 }
 
-void delete_cursor_to_mark() {
+void do_cursor_right() {
+    EditorRow* row = E.get_row_at(E.cy);
+    if (E.cx < row->len()) E.set_cpos(E.cx+1, E.cy);
+    else if (E.cy != (E.lastrow_idx()) && E.cx == row->len()) {
+        E.set_cpos(0, E.cy+1);
+    }
+}
+
+void do_cursor_line_begin() {
+    E.set_cpos(0, E.cy);
+}
+
+void do_cursor_line_end() {
+    EditorRow* row = E.get_row_at(E.cy);
+    if (row) E.set_cpos(row->len(), E.cy);
+}
+
+void change_mode(EditorMode mode) {
+    E.mode = mode;
+    E.cmdline = "";
+    E.cmdline_style = NONE;
+    E.cmdx = 0;
+    E.cmdoff = 0;
+}
+
+void do_change_mode_to_normal() {
+    change_mode(NORMAL);
+}
+
+void do_change_mode_to_insert() {
+    change_mode(INSERT);
+}
+
+void do_change_mode_to_command() {
+    change_mode(COMMAND);
+}
+
+void do_change_mode_to_search() {
+    change_mode(SEARCH);
+}
+
+void do_set_mark() {
+    E.mx = E.cx;
+    E.my = E.cy;
+}
+
+void do_cut_cursor_mark_region() {
     int startx, starty, endx, endy;
     if (E.my < E.cy) {
         starty = E.my;
@@ -1031,131 +1015,142 @@ void delete_cursor_to_mark() {
     copy_to_clipboard(copy);
 }
 
-void cursor_forward_word() {
+void do_cursor_forward_word() {
     while (!isalpha(E.get_char_at_cpos()) && !E.is_cpos_at_end())
-        do_action(CURSOR_RIGHT);
+        do_cursor_right();
     if (!E.is_cpos_at_end()) {
-        while (isalpha(E.get_char_at_cpos())) do_action(CURSOR_RIGHT);
+        while (isalpha(E.get_char_at_cpos())) do_cursor_right();
     }
 }
 
-void cursor_backward_word() {
+void do_cursor_backward_word() {
     if (E.cx == 0 && E.cy == 0) return;
     while (!(isalpha(E.get_char_at_lpos()) || E.get_char_at_lpos() == '\0'))
-        do_action(CURSOR_LEFT);
+        do_cursor_left();
     while (isalpha(E.get_char_at_lpos())) {
-        do_action(CURSOR_LEFT);
+        do_cursor_left();
     }
 }
 
-void update_cx_when_cy_changed() {
-    if (E.numrows() != 0) {
-        // We calculate E.cx from E.rx and update it
-        // instead of directly updating E.rx
-        // because E.rx is calculated on
-        // every refresh (throwing the prev value away).
-        // So we "choose" a E.cx which
-        // will be converted to the needed E.rx in the
-        // refresh stage.
-        E.cx = row_rx_to_cx(E.get_row_at(E.cy), E.tx > E.rx ? E.tx : E.rx);
-    }
+void do_cursor_first_row() {
+    E.cy = 0;
+    update_cx_when_cy_changed();
 }
 
-void do_action(EditorAction a) {
+void do_cursor_last_row() {
+    E.cy = E.lastrow_idx();
+    update_cx_when_cy_changed();
+}
+
+void do_insert_newline(bool autoindent) {
+    insert_empty_row_if_file_empty();
+
+    if (E.cx == 0) {
+        insert_row(E.cy, "");
+    } else {
+        EditorRow* row = E.get_row_at(E.cy);
+        insert_row(E.cy+1, row->data.substr(E.cx, row->len()-E.cx));
+        row->data = row->data.substr(0, E.cx);
+        update_row(row);
+    }
+    E.set_cpos(0, E.cy+1);
+    if (autoindent) row_indent_to_prev_indent(E.get_row_at(E.cy));
+}
+
+void do_insert_char(int c) {
+    if (c == '\n') {
+        // We do not autoindent because this code
+        // can be called by other functions such
+        // as the paste code.
+        do_insert_newline(false);
+        return;
+    }
+
+    insert_empty_row_if_file_empty();
+
+    row_insert_char(E.get_row_at(E.cy), E.cx, c);
+    E.set_cpos(E.cx+1, E.cy);
+}
+
+void do_delete_left_char() {
+    if (E.cx == 0 && E.cy == 0) return;
     EditorRow* row = E.get_row_at(E.cy);
-    switch (a) {
-        case CURSOR_UP: {
-            if (E.cy != 0) E.cy--;
-            update_cx_when_cy_changed();
-        } break;
 
-        case CURSOR_DOWN: {
-            if (E.cy < E.lastrow_idx()) E.cy++;
-            update_cx_when_cy_changed();
-        } break;
-
-        case CURSOR_LEFT: {
-            if (E.cx != 0) E.set_cpos(E.cx-1, E.cy);
-            else if (E.cy > 0) {
-                E.set_cpos(E.get_row_at(E.cy-1)->len(), E.cy-1);
-            }
-        } break;
-
-        case CURSOR_RIGHT: {
-            if (E.cx < row->len()) E.set_cpos(E.cx+1, E.cy);
-            else if (E.cy != (E.lastrow_idx()) && E.cx == row->len()) {
-                E.set_cpos(0, E.cy+1);
-            }
-        } break;
-
-        case CURSOR_LINE_BEGIN: {
-            E.set_cpos(0, E.cy);
-        } break;
-
-        case CURSOR_LINE_END: {
-            if (row) E.set_cpos(row->len(), E.cy);
-        } break;
-
-        case MODE_CHANGE_NORMAL: {
-            E.mode = NORMAL;
-            E.cmdline = "";
-            E.cmdline_style = NONE;
-        } break;
-
-        case MODE_CHANGE_INSERT: E.mode = INSERT; break;
-
-        case MODE_CHANGE_COMMAND:
-        case MODE_CHANGE_SEARCH: {
-            E.mode = (a == MODE_CHANGE_COMMAND) ? COMMAND : SEARCH;
-            E.cmdline = "";
-            E.cmdline_style = NONE;
-            E.cmdx = 0;
-            E.cmdoff = 0;
-        } break;
-
-        case MARK_SET: {
-            E.mx = E.cx;
-            E.my = E.cy;
-        } break;
-
-        case CURSOR_TO_MARK_CUT: {
-            delete_cursor_to_mark();
-        } break;
-
-        case CURSOR_FORWARD_WORD: cursor_forward_word(); break;
-        case CURSOR_BACKWARD_WORD: cursor_backward_word(); break;
-
-        case CURSOR_FILE_TOP: {
-            E.cy = 0;
-            update_cx_when_cy_changed();
-        } break;
-        case CURSOR_FILE_BOTTOM: {
-            E.cy = E.lastrow_idx();
-            update_cx_when_cy_changed();
-        } break;
-
-        case NEWLINE_INSERT: insert_newline(true); break;
-        case LEFT_CHAR_DELETE: delete_left_char(); break;
-        case CURRENT_CHAR_DELETE: delete_current_char(); break;
-
-        case CLIPBOARD_PASTE: paste_from_clipboard(); break;
-
-        case FILE_SAVE: save_file(); break;
-
-        case EDITOR_EXIT: {
-            if (E.dirty && E.quit_times > 0) {
-                set_cmdline_msg_error("File has unsaved changes: press [backtick] {} more times to quit", E.quit_times);
-                E.quit_times--;
-            } else {
-                core::succ_exit();
-            }
-        } return; // Always return from EDITOR_EXIT
-
-        default: assert(0 && "do_action(): unknown action");
+    if (E.cx > 0) {
+        row_delete_range(row, E.cx-1, 1);
+        E.set_cpos(E.cx-1, E.cy);
+    } else {
+        E.set_cpos(E.get_row_at(E.cy-1)->len(), E.cy-1);
+        row_append_string(E.get_row_at(E.cy), row->data);
+        delete_row(E.cy+1);
     }
 
+    delete_empty_row_if_file_empty();
+}
+
+void do_delete_current_char() {
+    EditorRow* row = E.get_row_at(E.cy);
+    if (!row) return;
+
+    if (E.cx == row->len()) {
+        if (E.cy < E.lastrow_idx()) {
+            row_append_string(row, E.get_row_at(E.cy+1)->data);
+            delete_row(E.cy+1);
+        }
+    } else {
+        row_delete_range(row, E.cx, 1);
+    }
+
+    delete_empty_row_if_file_empty();
+}
+
+void do_paste_from_clipboard() {
+    const std::string& clip = E.clipboard;
+    usize sz = clip.size();
+    for (usize i = 0; i < sz; i++) {
+        do_insert_char(clip[i]);
+    }
+}
+
+void do_open_line_below_cursor() {
+    insert_row(E.cy+1, "");
+    E.set_cpos(0, E.cy+1);
+    row_indent_to_prev_indent(E.get_row_at(E.cy));
+    do_change_mode_to_insert();
+}
+
+void do_save_file() {
+    file_trim_trailing_ws();
+
+    if (E.path == "") {
+        set_cmdline_msg_info("no filename");
+        return;
+    }
+    std::string tmp_path = E.path + ".tmp";
+    std::ofstream f(tmp_path);
+    if (!f) set_cmdline_msg_error("cannot open file for saving");
+
+    std::string contents = rows_to_string();
+    f << contents;
+    f.close();
+    if (!f) set_cmdline_msg_error("cannot write to file for saving");
+    system(std::string("mv " + tmp_path + " " + E.path).c_str());
+    set_cmdline_msg_info("{} bytes written", contents.size());
+    E.dirty = false;
+}
+
+void do_exit_editor() {
+    if (E.dirty && E.quit_times > 0) {
+        set_cmdline_msg_error("File has unsaved changes: press [backtick] {} more times to quit", E.quit_times);
+        E.quit_times--;
+    } else {
+        core::succ_exit();
+    }
+}
+
+void do_after_action() {
     E.quit_times = NUM_FORCE_QUIT_PRESS;
-    row = E.get_row_at(E.cy);
+    EditorRow* row = E.get_row_at(E.cy);
     int rowlen = row ? row->len() : 0;
     if (E.cx > rowlen) {
         E.cx = rowlen;
@@ -1167,9 +1162,9 @@ void process_keypress() {
     int c = read_key();
     if (E.mode == NORMAL) {
         switch (c) {
-            case 'i': do_action(MODE_CHANGE_INSERT); break;
-            case 'w': do_action(CURRENT_CHAR_DELETE); break;
-            case '`': do_action(EDITOR_EXIT); break;
+            case 'i': do_change_mode_to_insert(); break;
+            case 'w': do_delete_current_char(); break;
+            case '`': do_exit_editor(); break;
             case CTRL_KEY('f'):
             case CTRL_KEY('r'): {
                 if (c == CTRL_KEY('r')) {
@@ -1184,32 +1179,25 @@ void process_keypress() {
 
                 int times = E.screenrows;
                 while (times--)
-                    do_action(c == CTRL_KEY('r') ? CURSOR_UP : CURSOR_DOWN);
+                    if (c == CTRL_KEY('r')) do_cursor_up();
+                    else do_cursor_down();
             } break;
-            case 'a': do_action(CURSOR_LINE_BEGIN); break;
-            case ';': do_action(CURSOR_LINE_END); break;
-            case ARROW_LEFT:  do_action(CURSOR_LEFT); break;
-            case ARROW_RIGHT: do_action(CURSOR_RIGHT); break;
-            case ARROW_UP:    do_action(CURSOR_UP); break;
-            case ARROW_DOWN:  do_action(CURSOR_DOWN); break;
-            case 'h': do_action(CURSOR_LEFT); break;
-            case 'j': do_action(CURSOR_DOWN); break;
-            case 'k': do_action(CURSOR_UP); break;
-            case 'l': do_action(CURSOR_RIGHT); break;
-
-            case 'o': do_action(CURSOR_FORWARD_WORD); break;
-            case 'n': do_action(CURSOR_BACKWARD_WORD); break;
-
-            case ',': {
-                insert_row(E.cy+1, "");
-                E.set_cpos(0, E.cy+1);
-                row_indent_to_prev_indent(E.get_row_at(E.cy));
-                do_action(MODE_CHANGE_INSERT);
-            } break;
-
-            case 'd': do_action(MARK_SET); break;
-            case 'f': do_action(CURSOR_TO_MARK_CUT); break;
-            case 'c': do_action(CLIPBOARD_PASTE); break;
+            case 'a': do_cursor_line_begin(); break;
+            case ';': do_cursor_line_end(); break;
+            case ARROW_LEFT:  do_cursor_left(); break;
+            case ARROW_RIGHT: do_cursor_right(); break;
+            case ARROW_UP:    do_cursor_up(); break;
+            case ARROW_DOWN:  do_cursor_down(); break;
+            case 'h': do_cursor_left(); break;
+            case 'l': do_cursor_right(); break;
+            case 'k': do_cursor_up(); break;
+            case 'j': do_cursor_down(); break;
+            case 'o': do_cursor_forward_word(); break;
+            case 'n': do_cursor_backward_word(); break;
+            case ',': do_open_line_below_cursor(); break;
+            case 'd': do_set_mark(); break;
+            case 'f': do_cut_cursor_mark_region(); break;
+            case 'c': do_paste_from_clipboard(); break;
 
             case 'b': {
                 if (E.search_default == "") {
@@ -1227,49 +1215,36 @@ void process_keypress() {
                 }
             } break;
 
-            case ALT_M: do_action(MODE_CHANGE_COMMAND); break;
-            case ALT_S: do_action(FILE_SAVE); break;
-            case '/': do_action(MODE_CHANGE_SEARCH); break;
+            case ALT_M: do_change_mode_to_command(); break;
+            case ALT_S: do_save_file(); break;
+            case '/': do_change_mode_to_search(); break;
             case BACKSPACE: break;
             case '\r': break;
             case '\x1b': break;
-
             case 'g': {
                 c = read_key();
                 switch (c) {
-                    case 'k': {
-                        do_action(CURSOR_FILE_TOP);
-                    } break;
-
-                    case 'j': {
-                        do_action(CURSOR_FILE_BOTTOM);
-                    } break;
-
+                    case 'g': do_cursor_first_row(); break;
                     case '\x1b': break;
-
-                    default: {
-                        set_cmdline_msg_error("invalid key 'g {}' in normal mode", (int)c);
-                    } break;
+                    default: set_cmdline_msg_error("invalid key 'g {}' in normal mode", (int)c);
                 }
             } break;
-
-            default: {
-                set_cmdline_msg_error("invalid key '{}' in normal mode", (int)c);
-            } break;
+            case 'G': do_cursor_last_row(); break;
+            default: set_cmdline_msg_error("invalid key '{}' in normal mode", (int)c);
         }
 
     } else if (E.mode == INSERT) {
         switch (c) {
-            case BACKSPACE: do_action(LEFT_CHAR_DELETE); break;
-            case '\r':      do_action(NEWLINE_INSERT); break;
-            case '\t':      insert_char(c); break;
-            case ARROW_LEFT:  do_action(CURSOR_LEFT); break;
-            case ARROW_RIGHT: do_action(CURSOR_RIGHT); break;
-            case ARROW_UP:    do_action(CURSOR_UP); break;
-            case ARROW_DOWN:  do_action(CURSOR_DOWN); break;
-            case '\x1b': do_action(MODE_CHANGE_NORMAL); break;
+            case BACKSPACE: do_delete_left_char(); break;
+            case '\r':      do_insert_newline(true); break;
+            case '\t':      do_insert_char(c); break;
+            case ARROW_LEFT:  do_cursor_left(); break;
+            case ARROW_RIGHT: do_cursor_right(); break;
+            case ARROW_UP:    do_cursor_up(); break;
+            case ARROW_DOWN:  do_cursor_down(); break;
+            case '\x1b': do_change_mode_to_normal(); break;
             default: {
-                if (is_char_printable(c)) insert_char(c);
+                if (is_char_printable(c)) do_insert_char(c);
                 else set_cmdline_msg_error("non-printable key '{}' in insert mode", (int)c);
             } break;
         }
@@ -1279,10 +1254,10 @@ void process_keypress() {
             case '\r': {
                 std::string txt = E.cmdline;
                 EditorMode mode = E.mode;
-                do_action(MODE_CHANGE_NORMAL);
+                do_change_mode_to_normal();
 
                 if (mode == COMMAND) {
-                    if (txt == "quit") do_action(EDITOR_EXIT);
+                    if (txt == "quit") do_exit_editor();
                     else if (str_startswith(txt, "path")) {
                         set_path(txt.substr(5));
                     }
@@ -1298,7 +1273,7 @@ void process_keypress() {
                     E.cmdline.erase(E.cmdx-1, 1);
                     E.cmdx--;
                 } else if (E.cmdx == 0 && E.cmdline.size() == 0) {
-                    do_action(MODE_CHANGE_NORMAL);
+                    do_change_mode_to_normal();
                 }
 
                 if (E.mode == SEARCH) {
@@ -1317,7 +1292,7 @@ void process_keypress() {
                 E.cmdx = E.cmdline_len();
             } break;
 
-            case '\x1b': do_action(MODE_CHANGE_NORMAL); break;
+            case '\x1b': do_change_mode_to_normal(); break;
 
             default: {
                 if (is_char_printable(c)) {
@@ -1328,9 +1303,13 @@ void process_keypress() {
                 if (E.mode == SEARCH) {
                     search_text_forward(E.cmdline, false);
                 }
-            } break;
+            // We return because `do_after_action()` resets the highlight,
+            // and we don't want that now.
+            } return;
         }
     }
+
+    do_after_action();
 }
 
 void update_rx() {
