@@ -249,6 +249,7 @@ struct EditorConfig {
     int quit_times;
     std::string search_default;
     std::string clipboard;
+    bool skip_after_action;
 
     std::ofstream keylog;
 
@@ -1146,16 +1147,21 @@ void do_exit_editor() {
     } else {
         core::succ_exit();
     }
+    E.skip_after_action = true;
 }
 
 void do_after_action() {
-    E.quit_times = NUM_FORCE_QUIT_PRESS;
     EditorRow* row = E.get_row_at(E.cy);
     int rowlen = row ? row->len() : 0;
     if (E.cx > rowlen) {
         E.cx = rowlen;
     }
-    E.reset_hlt();
+
+    if (!E.skip_after_action) {
+        E.quit_times = NUM_FORCE_QUIT_PRESS;
+        E.reset_hlt();
+    }
+    E.skip_after_action = false;
 }
 
 void process_keypress() {
@@ -1250,6 +1256,7 @@ void process_keypress() {
         }
 
     } else if (E.mode == COMMAND || E.mode == SEARCH) {
+        E.skip_after_action = true;
         switch (c) {
             case '\r': {
                 std::string txt = E.cmdline;
@@ -1292,7 +1299,10 @@ void process_keypress() {
                 E.cmdx = E.cmdline_len();
             } break;
 
-            case '\x1b': do_change_mode_to_normal(); break;
+            case '\x1b': {
+                E.skip_after_action = false;
+                do_change_mode_to_normal();
+            } break;
 
             default: {
                 if (is_char_printable(c)) {
@@ -1303,9 +1313,7 @@ void process_keypress() {
                 if (E.mode == SEARCH) {
                     search_text_forward(E.cmdline, false);
                 }
-            // We return because `do_after_action()` resets the highlight,
-            // and we don't want that now.
-            } return;
+            } break;
         }
     }
 
@@ -1539,6 +1547,7 @@ void init_editor() {
     E.abuf.reserve(5*1024);
     E.cmdline_msg_time = 0;
     E.quit_times = NUM_FORCE_QUIT_PRESS;
+    E.skip_after_action = false;
     E.keylog = std::ofstream("key.txt", std::ios_base::app);
     E.keylog << "\n============= new stream ==========\n";
 }
