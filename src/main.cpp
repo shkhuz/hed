@@ -1378,6 +1378,7 @@ void update_rx() {
 void draw_rows() {
     for (int y = 0; y < E.screenrows; y++) {
         int filerow = y + E.rowoff;
+        ewrite("\x1b[K");
         if (filerow >= E.numrows()) {
             if (E.numrows() == 0 && y == E.screenrows / 3) {
                 std::string welcome = "hed editor -- maintained by shkhuz";
@@ -1449,7 +1450,6 @@ void draw_rows() {
             ewrite("\x1b[39m");
         }
 
-        ewrite("\x1b[K");
         if (y < E.screenrows-1) {
             ewrite("\r\n");
         }
@@ -1518,6 +1518,7 @@ void draw_cmdline() {
 
 void draw_debug_info() {
     ewrite("\r\n");
+    ewrite("\x1b[K");
     std::string debug_info = fmt::format(
         "cmdx: {}, cmdoff: {}, len(cmd): {}, rows: {}, cx = {}, cy: {}, cx (calc): {}, rx: {}, tx: {}",
         E.cmdx,
@@ -1532,7 +1533,6 @@ void draw_debug_info() {
     int len = debug_info.size();
     if (len > E.screencols) len = E.screencols;
     ewrite_with_len(debug_info, len);
-    ewrite("\x1b[K");
 }
 
 void refresh_screen() {
