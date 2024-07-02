@@ -62,6 +62,7 @@ enum EditorAction {
     OPEN_LINE_BELOW_CURSOR,
     SAVE_FILE,
     EXIT_EDITOR,
+    FORCE_EXIT_EDITOR,
     CURSOR_PAGE_UP,
     CURSOR_PAGE_DOWN,
     REPEAT_SEARCH_FORWARD,
@@ -196,6 +197,12 @@ enum CmdlineStyle {
     ERROR,
 };
 
+struct UndoInfo {
+    EditorAction type;
+    std::string data;
+    int x, y;
+};
+
 struct EditorRow {
     std::string data;
     std::string rdata;
@@ -253,6 +260,10 @@ struct EditorConfig {
     std::string cmdline;
     time_t cmdline_msg_time;
     CmdlineStyle cmdline_style;
+    std::vector<UndoInfo> undos;
+    // Index of `UndoInfo` that will be applied
+    // if undo action called.
+    int undo_pos;
     int quit_times;
     std::string search_default;
     std::string clipboard;
@@ -312,6 +323,14 @@ struct EditorConfig {
         hltsy = 0;
         hltex = 0;
         hltey = 0;
+    }
+
+    int numundos() {
+        return (int)undos.size();
+    }
+
+    UndoInfo* lastundo() {
+        return &undos.data()[undos.size()-1];
     }
 };
 EditorConfig E;
@@ -729,6 +748,18 @@ void scroll_cmdline() {
     }
 }
 
+void push_undoinfo(EditorAction type, std::string data) {
+    while (E.undo_pos != E.numundos()-1) E.undos.pop_back();
+
+    E.undos.push_back({
+        .type = type,
+        .data = data,
+        .x = E.cx,
+        .y = E.cy,
+    });
+    E.undo_pos = E.numundos()-1;
+}
+
 const char* WHITESPACE = " \t\n\r\f\v";
 
 void str_trim_trailing_ws(std::string& s) {
@@ -1049,7 +1080,8 @@ void do_cursor_last_row() {
     update_cx_when_cy_changed();
 }
 
-void do_insert_newline(bool autoindent) {
+void do_insert_newline(bool hist, bool autoindent) {
+    if (hist) push_undoinfo(INSERT_NEWLINE, std::string(1, '\n'));
     insert_empty_row_if_file_empty();
 
     if (E.cx == 0) {
@@ -1064,12 +1096,13 @@ void do_insert_newline(bool autoindent) {
     if (autoindent) row_indent_to_prev_indent(E.get_row_at(E.cy));
 }
 
-void do_insert_char(int c) {
+void do_insert_char(bool hist, int c) {
+    if (hist) push_undoinfo(INSERT_CHAR, std::string(1, c));
     if (c == '\n') {
         // We do not autoindent because this code
         // can be called by other functions such
         // as the paste code.
-        do_insert_newline(false);
+        do_insert_newline(hist, false);
         return;
     }
 
@@ -1095,16 +1128,18 @@ void do_delete_left_char() {
     delete_empty_row_if_file_empty();
 }
 
-void do_delete_current_char() {
+void do_delete_current_char(bool hist) {
     EditorRow* row = E.get_row_at(E.cy);
     if (!row) return;
 
     if (E.cx == row->len()) {
         if (E.cy < E.lastrow_idx()) {
+            if (hist) push_undoinfo(DELETE_CURRENT_CHAR, std::string("\n"));
             row_append_string(row, E.get_row_at(E.cy+1)->data);
             delete_row(E.cy+1);
         }
     } else {
+        if (hist) push_undoinfo(DELETE_CURRENT_CHAR, std::string(1, row->data[E.cx]));
         row_delete_range(row, E.cx, 1);
     }
 
@@ -1115,7 +1150,7 @@ void do_paste_from_clipboard() {
     const std::string& clip = E.clipboard;
     usize sz = clip.size();
     for (usize i = 0; i < sz; i++) {
-        do_insert_char(clip[i]);
+        do_insert_char(false, clip[i]);
     }
 }
 
@@ -1153,6 +1188,10 @@ void do_exit_editor() {
     } else {
         core::succ_exit();
     }
+}
+
+void do_force_exit_editor() {
+    core::succ_exit();
 }
 
 void cursor_page_up_down(bool down) {
@@ -1198,7 +1237,41 @@ void do_repeat_search_backward() {
     repeat_search(false);
 }
 
-void do_action(EditorAction action, ...) {
+void do_undo_or_redo(bool undo) {
+    if (E.numundos() == 0) return;
+    if (undo && E.undo_pos == -1) return;
+    if (!undo && E.undo_pos == E.numundos()-1) return;
+
+    int uidx = undo ? E.undo_pos : E.undo_pos+1;
+    if (undo) E.undo_pos--;
+    else E.undo_pos++;
+
+    UndoInfo u = E.undos[uidx];
+
+    if ((u.type == INSERT_CHAR && undo)
+            || (u.type == INSERT_NEWLINE && undo)
+            || (u.type == DELETE_CURRENT_CHAR && !undo)) {
+        E.set_cpos(u.x, u.y);
+        do_delete_current_char(false);
+    } else if ((u.type == DELETE_CURRENT_CHAR && undo)
+            || (u.type == INSERT_CHAR && !undo)
+            || (u.type == INSERT_NEWLINE && !undo)) {
+        E.set_cpos(u.x, u.y);
+        do_insert_char(false, u.data[0]);
+        int x = u.x;
+        int y = u.y;
+
+        if (u.type == INSERT_CHAR) x = u.x+1;
+        else if (u.type == INSERT_NEWLINE) x = 0;
+        if (u.type == INSERT_NEWLINE) y += 1;
+
+        E.set_cpos(x, y);
+    } else {
+        set_cmdline_msg_error("[internal] don't know how to undo last change");
+    }
+}
+
+void do_action(int action, ...) {
     switch (action) {
         case CURSOR_UP:                      do_cursor_up(); break;
         case CURSOR_DOWN:                    do_cursor_down(); break;
@@ -1216,13 +1289,14 @@ void do_action(EditorAction action, ...) {
         case CURSOR_BACKWARD_WORD:           do_cursor_backward_word(); break;
         case CURSOR_FIRST_ROW:               do_cursor_first_row(); break;
         case CURSOR_LAST_ROW:                do_cursor_last_row(); break;
-        case INSERT_NEWLINE:                 do_insert_newline(true); break;
+        case INSERT_NEWLINE:                 do_insert_newline(true, true); break;
         case DELETE_LEFT_CHAR:               do_delete_left_char(); break;
-        case DELETE_CURRENT_CHAR:            do_delete_current_char(); break;
+        case DELETE_CURRENT_CHAR:            do_delete_current_char(true); break;
         case PASTE_FROM_CLIPBOARD:           do_paste_from_clipboard(); break;
         case OPEN_LINE_BELOW_CURSOR:         do_open_line_below_cursor(); break;
         case SAVE_FILE:                      do_save_file(); break;
         case EXIT_EDITOR:                    do_exit_editor(); return;
+        case FORCE_EXIT_EDITOR:              do_force_exit_editor(); return;
         case CURSOR_PAGE_UP:                 do_cursor_page_up(); break;
         case CURSOR_PAGE_DOWN:               do_cursor_page_down(); break;
         case REPEAT_SEARCH_FORWARD:          do_repeat_search_forward(); break;
@@ -1232,7 +1306,7 @@ void do_action(EditorAction action, ...) {
             va_start(args, action);
             int c = va_arg(args, int);
             va_end(args);
-            do_insert_char(c);
+            do_insert_char(true, c);
         } break;
     }
 
@@ -1288,6 +1362,8 @@ void process_keypress() {
                     default: set_cmdline_msg_error("invalid key 'g {}' in normal mode", (int)c);
                 }
             } break;
+            case 'e': do_undo_or_redo(true); break;
+            case 'E': do_undo_or_redo(false); break;
             default: set_cmdline_msg_error("invalid key '{}' in normal mode", (int)c);
         }
 
@@ -1295,7 +1371,7 @@ void process_keypress() {
         switch (c) {
             case BACKSPACE:             do_action(DELETE_LEFT_CHAR); break;
             case '\r':                  do_action(INSERT_NEWLINE); break;
-            case '\t':                  do_insert_char(c); break;
+            case '\t':                  do_insert_char(true, c); break;
             case ARROW_LEFT:            do_action(CURSOR_LEFT); break;
             case ARROW_DOWN:            do_action(CURSOR_DOWN); break;
             case ARROW_UP:              do_action(CURSOR_UP); break;
@@ -1316,6 +1392,7 @@ void process_keypress() {
 
                 if (mode == COMMAND) {
                     if (txt == "quit") do_action(EXIT_EDITOR);
+                    else if (txt == "forcequit") do_action(FORCE_EXIT_EDITOR);
                     else if (str_startswith(txt, "path")) {
                         set_path(txt.substr(5));
                     }
@@ -1595,6 +1672,7 @@ void init_editor() {
     E.abuf.reserve(5*1024);
     E.cmdline_msg_time = 0;
     E.quit_times = NUM_FORCE_QUIT_PRESS;
+    E.undo_pos = -1;
     E.keylog = std::ofstream("key.txt", std::ios_base::app);
     E.keylog << "\n============= new stream ==========\n";
 }

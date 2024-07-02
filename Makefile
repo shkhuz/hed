@@ -10,7 +10,7 @@ ifdef d
 	FLAGS += -D_DEBUG
 endif
 
-CC := g++
+CC := clang++
 
 run: build/hed
 	./build/hed tabtest.txt
