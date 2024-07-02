@@ -11,6 +11,7 @@
 #include <fstream>
 #include <cassert>
 #include <ctime>
+#include <cstdarg>
 
 #include <fmt/format.h>
 
@@ -41,24 +42,30 @@ enum EditorAction {
     CURSOR_DOWN,
     CURSOR_LEFT,
     CURSOR_RIGHT,
-    CURSOR_FORWARD_WORD,
-    CURSOR_BACKWARD_WORD,
     CURSOR_LINE_BEGIN,
     CURSOR_LINE_END,
-    CURSOR_FILE_TOP,
-    CURSOR_FILE_BOTTOM,
-    MARK_SET,
-    CURSOR_TO_MARK_CUT,
-    MODE_CHANGE_NORMAL,
-    MODE_CHANGE_INSERT,
-    MODE_CHANGE_COMMAND,
-    MODE_CHANGE_SEARCH,
-    NEWLINE_INSERT,
-    LEFT_CHAR_DELETE,
-    CURRENT_CHAR_DELETE,
-    CLIPBOARD_PASTE,
-    FILE_SAVE,
-    EDITOR_EXIT,
+    CHANGE_MODE_TO_NORMAL,
+    CHANGE_MODE_TO_INSERT,
+    CHANGE_MODE_TO_COMMAND,
+    CHANGE_MODE_TO_SEARCH,
+    SET_MARK,
+    CUT_CURSOR_MARK_REGION,
+    CURSOR_FORWARD_WORD,
+    CURSOR_BACKWARD_WORD,
+    CURSOR_FIRST_ROW,
+    CURSOR_LAST_ROW,
+    INSERT_NEWLINE,
+    INSERT_CHAR,
+    DELETE_LEFT_CHAR,
+    DELETE_CURRENT_CHAR,
+    PASTE_FROM_CLIPBOARD,
+    OPEN_LINE_BELOW_CURSOR,
+    SAVE_FILE,
+    EXIT_EDITOR,
+    CURSOR_PAGE_UP,
+    CURSOR_PAGE_DOWN,
+    REPEAT_SEARCH_FORWARD,
+    REPEAT_SEARCH_BACKWARD,
 };
 
 enum EditorKey {
@@ -249,7 +256,6 @@ struct EditorConfig {
     int quit_times;
     std::string search_default;
     std::string clipboard;
-    bool skip_after_action;
 
     std::ofstream keylog;
 
@@ -1147,124 +1153,169 @@ void do_exit_editor() {
     } else {
         core::succ_exit();
     }
-    E.skip_after_action = true;
 }
 
-void do_after_action() {
+void cursor_page_up_down(bool down) {
+    if (down) {
+        E.cy = E.rowoff + E.screenrows - 1;
+        if (E.cy > E.lastrow_idx()) {
+            E.cy = E.lastrow_idx();
+        }
+    } else {
+        E.cy = E.rowoff;
+    }
+    update_cx_when_cy_changed();
+
+    int times = E.screenrows;
+    while (times--) {
+        if (down) do_cursor_down();
+        else do_cursor_up();
+    }
+}
+
+void do_cursor_page_up() {
+    cursor_page_up_down(false);
+}
+
+void do_cursor_page_down() {
+    cursor_page_up_down(true);
+}
+
+void repeat_search(bool forward) {
+    if (E.search_default == "") {
+        set_cmdline_msg_error("empty prev search");
+    } else {
+        if (forward) search_text_forward(E.search_default, true);
+        else search_text_backward(E.search_default, true);
+    }
+}
+
+void do_repeat_search_forward() {
+    repeat_search(true);
+}
+
+void do_repeat_search_backward() {
+    repeat_search(false);
+}
+
+void do_action(EditorAction action, ...) {
+    switch (action) {
+        case CURSOR_UP:                      do_cursor_up(); break;
+        case CURSOR_DOWN:                    do_cursor_down(); break;
+        case CURSOR_LEFT:                    do_cursor_left(); break;
+        case CURSOR_RIGHT:                   do_cursor_right(); break;
+        case CURSOR_LINE_BEGIN:              do_cursor_line_begin(); break;
+        case CURSOR_LINE_END:                do_cursor_line_end(); break;
+        case CHANGE_MODE_TO_NORMAL:          do_change_mode_to_normal(); break;
+        case CHANGE_MODE_TO_INSERT:          do_change_mode_to_insert(); break;
+        case CHANGE_MODE_TO_COMMAND:         do_change_mode_to_command(); break;
+        case CHANGE_MODE_TO_SEARCH:          do_change_mode_to_search(); break;
+        case SET_MARK:                       do_set_mark(); break;
+        case CUT_CURSOR_MARK_REGION:         do_cut_cursor_mark_region(); break;
+        case CURSOR_FORWARD_WORD:            do_cursor_forward_word(); break;
+        case CURSOR_BACKWARD_WORD:           do_cursor_backward_word(); break;
+        case CURSOR_FIRST_ROW:               do_cursor_first_row(); break;
+        case CURSOR_LAST_ROW:                do_cursor_last_row(); break;
+        case INSERT_NEWLINE:                 do_insert_newline(true); break;
+        case DELETE_LEFT_CHAR:               do_delete_left_char(); break;
+        case DELETE_CURRENT_CHAR:            do_delete_current_char(); break;
+        case PASTE_FROM_CLIPBOARD:           do_paste_from_clipboard(); break;
+        case OPEN_LINE_BELOW_CURSOR:         do_open_line_below_cursor(); break;
+        case SAVE_FILE:                      do_save_file(); break;
+        case EXIT_EDITOR:                    do_exit_editor(); return;
+        case CURSOR_PAGE_UP:                 do_cursor_page_up(); break;
+        case CURSOR_PAGE_DOWN:               do_cursor_page_down(); break;
+        case REPEAT_SEARCH_FORWARD:          do_repeat_search_forward(); break;
+        case REPEAT_SEARCH_BACKWARD:         do_repeat_search_backward(); break;
+        case INSERT_CHAR: {
+            va_list args;
+            va_start(args, action);
+            int c = va_arg(args, int);
+            va_end(args);
+            do_insert_char(c);
+        } break;
+    }
+
     EditorRow* row = E.get_row_at(E.cy);
     int rowlen = row ? row->len() : 0;
     if (E.cx > rowlen) {
         E.cx = rowlen;
     }
 
-    if (!E.skip_after_action) {
-        E.quit_times = NUM_FORCE_QUIT_PRESS;
-        E.reset_hlt();
-    }
-    E.skip_after_action = false;
+    E.quit_times = NUM_FORCE_QUIT_PRESS;
+    E.reset_hlt();
 }
 
 void process_keypress() {
     int c = read_key();
     if (E.mode == NORMAL) {
         switch (c) {
-            case 'i': do_change_mode_to_insert(); break;
-            case 'w': do_delete_current_char(); break;
-            case '`': do_exit_editor(); break;
-            case CTRL_KEY('f'):
-            case CTRL_KEY('r'): {
-                if (c == CTRL_KEY('r')) {
-                    E.cy = E.rowoff;
-                } else if (c == CTRL_KEY('f')) {
-                    E.cy = E.rowoff + E.screenrows - 1;
-                    if (E.cy > E.lastrow_idx()) {
-                        E.cy = E.lastrow_idx();
-                    }
-                }
-                update_cx_when_cy_changed();
-
-                int times = E.screenrows;
-                while (times--)
-                    if (c == CTRL_KEY('r')) do_cursor_up();
-                    else do_cursor_down();
-            } break;
-            case 'a': do_cursor_line_begin(); break;
-            case ';': do_cursor_line_end(); break;
-            case ARROW_LEFT:  do_cursor_left(); break;
-            case ARROW_RIGHT: do_cursor_right(); break;
-            case ARROW_UP:    do_cursor_up(); break;
-            case ARROW_DOWN:  do_cursor_down(); break;
-            case 'h': do_cursor_left(); break;
-            case 'l': do_cursor_right(); break;
-            case 'k': do_cursor_up(); break;
-            case 'j': do_cursor_down(); break;
-            case 'o': do_cursor_forward_word(); break;
-            case 'n': do_cursor_backward_word(); break;
-            case ',': do_open_line_below_cursor(); break;
-            case 'd': do_set_mark(); break;
-            case 'f': do_cut_cursor_mark_region(); break;
-            case 'c': do_paste_from_clipboard(); break;
-
-            case 'b': {
-                if (E.search_default == "") {
-                    set_cmdline_msg_error("empty prev search");
-                } else {
-                    search_text_forward(E.search_default, true);
-                }
-            } break;
-
-            case 'B': {
-                if (E.search_default == "") {
-                    set_cmdline_msg_error("empty prev search");
-                } else {
-                    search_text_backward(E.search_default, true);
-                }
-            } break;
-
-            case ALT_M: do_change_mode_to_command(); break;
-            case ALT_S: do_save_file(); break;
-            case '/': do_change_mode_to_search(); break;
-            case BACKSPACE: break;
-            case '\r': break;
-            case '\x1b': break;
+            case 'i':                   do_action(CHANGE_MODE_TO_INSERT); break;
+            case 'w':                   do_action(DELETE_CURRENT_CHAR); break;
+            case '`':                   do_action(EXIT_EDITOR); break;
+            case 'U':                   do_action(CURSOR_PAGE_UP); break;
+            case 'M':                   do_action(CURSOR_PAGE_DOWN); break;
+            case 'a':                   do_action(CURSOR_LINE_BEGIN); break;
+            case ';':                   do_action(CURSOR_LINE_END); break;
+            case ARROW_LEFT:            do_action(CURSOR_LEFT); break;
+            case ARROW_DOWN:            do_action(CURSOR_DOWN); break;
+            case ARROW_UP:              do_action(CURSOR_UP); break;
+            case ARROW_RIGHT:           do_action(CURSOR_RIGHT); break;
+            case 'h':                   do_action(CURSOR_LEFT); break;
+            case 'j':                   do_action(CURSOR_DOWN); break;
+            case 'k':                   do_action(CURSOR_UP); break;
+            case 'l':                   do_action(CURSOR_RIGHT); break;
+            case 'o':                   do_action(CURSOR_FORWARD_WORD); break;
+            case 'n':                   do_action(CURSOR_BACKWARD_WORD); break;
+            case ',':                   do_action(OPEN_LINE_BELOW_CURSOR); break;
+            case 'd':                   do_action(SET_MARK); break;
+            case 'f':                   do_action(CUT_CURSOR_MARK_REGION); break;
+            case 'c':                   do_action(PASTE_FROM_CLIPBOARD); break;
+            case 'b':                   do_action(REPEAT_SEARCH_FORWARD); break;
+            case 'B':                   do_action(REPEAT_SEARCH_BACKWARD); break;
+            case ALT_M:                 do_action(CHANGE_MODE_TO_COMMAND); break;
+            case ALT_S:                 do_action(SAVE_FILE); break;
+            case '/':                   do_action(CHANGE_MODE_TO_SEARCH); break;
+            case BACKSPACE:             break;
+            case '\r':                  break;
+            case '\x1b':                break;
+            case 'G':                   do_action(CURSOR_LAST_ROW); break;
             case 'g': {
                 c = read_key();
                 switch (c) {
-                    case 'g': do_cursor_first_row(); break;
-                    case '\x1b': break;
+                    case 'g':           do_action(CURSOR_FIRST_ROW); break;
+                    case '\x1b':        break;
                     default: set_cmdline_msg_error("invalid key 'g {}' in normal mode", (int)c);
                 }
             } break;
-            case 'G': do_cursor_last_row(); break;
             default: set_cmdline_msg_error("invalid key '{}' in normal mode", (int)c);
         }
 
     } else if (E.mode == INSERT) {
         switch (c) {
-            case BACKSPACE: do_delete_left_char(); break;
-            case '\r':      do_insert_newline(true); break;
-            case '\t':      do_insert_char(c); break;
-            case ARROW_LEFT:  do_cursor_left(); break;
-            case ARROW_RIGHT: do_cursor_right(); break;
-            case ARROW_UP:    do_cursor_up(); break;
-            case ARROW_DOWN:  do_cursor_down(); break;
-            case '\x1b': do_change_mode_to_normal(); break;
+            case BACKSPACE:             do_action(DELETE_LEFT_CHAR); break;
+            case '\r':                  do_action(INSERT_NEWLINE); break;
+            case '\t':                  do_insert_char(c); break;
+            case ARROW_LEFT:            do_action(CURSOR_LEFT); break;
+            case ARROW_DOWN:            do_action(CURSOR_DOWN); break;
+            case ARROW_UP:              do_action(CURSOR_UP); break;
+            case ARROW_RIGHT:           do_action(CURSOR_RIGHT); break;
+            case '\x1b':                do_action(CHANGE_MODE_TO_NORMAL); break;
             default: {
-                if (is_char_printable(c)) do_insert_char(c);
+                if (is_char_printable(c)) do_action(INSERT_CHAR, c);
                 else set_cmdline_msg_error("non-printable key '{}' in insert mode", (int)c);
             } break;
         }
 
     } else if (E.mode == COMMAND || E.mode == SEARCH) {
-        E.skip_after_action = true;
         switch (c) {
             case '\r': {
                 std::string txt = E.cmdline;
                 EditorMode mode = E.mode;
-                do_change_mode_to_normal();
+                do_action(CHANGE_MODE_TO_NORMAL);
 
                 if (mode == COMMAND) {
-                    if (txt == "quit") do_exit_editor();
+                    if (txt == "quit") do_action(EXIT_EDITOR);
                     else if (str_startswith(txt, "path")) {
                         set_path(txt.substr(5));
                     }
@@ -1280,7 +1331,7 @@ void process_keypress() {
                     E.cmdline.erase(E.cmdx-1, 1);
                     E.cmdx--;
                 } else if (E.cmdx == 0 && E.cmdline.size() == 0) {
-                    do_change_mode_to_normal();
+                    do_action(CHANGE_MODE_TO_NORMAL);
                 }
 
                 if (E.mode == SEARCH) {
@@ -1300,8 +1351,7 @@ void process_keypress() {
             } break;
 
             case '\x1b': {
-                E.skip_after_action = false;
-                do_change_mode_to_normal();
+                do_action(CHANGE_MODE_TO_NORMAL);
             } break;
 
             default: {
@@ -1316,8 +1366,6 @@ void process_keypress() {
             } break;
         }
     }
-
-    do_after_action();
 }
 
 void update_rx() {
@@ -1547,7 +1595,6 @@ void init_editor() {
     E.abuf.reserve(5*1024);
     E.cmdline_msg_time = 0;
     E.quit_times = NUM_FORCE_QUIT_PRESS;
-    E.skip_after_action = false;
     E.keylog = std::ofstream("key.txt", std::ios_base::app);
     E.keylog << "\n============= new stream ==========\n";
 }
