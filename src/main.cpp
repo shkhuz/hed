@@ -333,6 +333,18 @@ struct EditorConfig {
     UndoInfo* lastundo() {
         return &undos.data()[undos.size()-1];
     }
+
+    void dbglog(const std::string& str) {
+#ifdef DBGLOG
+        keylog << str;
+#endif
+    }
+
+    void dbglog(char c) {
+#ifdef DBGLOG
+        keylog << c;
+#endif
+    }
 };
 EditorConfig E;
 
@@ -395,16 +407,16 @@ int read_key() {
 
     for (int i = 0; i < nread; i++) {
         switch (buf[i]) {
-            case '\x1b': E.keylog << "[esc]"; break;
-            case BACKSPACE: E.keylog << "[bksp]"; break;
-            case '\r': E.keylog << "[cr]"; break;
-            case '\n': E.keylog << "[nl]"; break;
-            case '\t': E.keylog << "[tab]"; break;
-            default: E.keylog << buf[i]; break;
+            case '\x1b':    E.dbglog("[esc]"); break;
+            case BACKSPACE: E.dbglog("[bksp]"); break;
+            case '\r':      E.dbglog("[cr]"); break;
+            case '\n':      E.dbglog("[nl]"); break;
+            case '\t':      E.dbglog("[tab]"); break;
+            default:        E.dbglog(std::string(1, buf[i])); break;
         }
-        E.keylog << ' ';
+        E.dbglog(' ');
     }
-    E.keylog << '\n';
+    E.dbglog('\n');
 
     if (buf[0] == '\x1b' && nread == 1) {
         return '\x1b';
@@ -920,7 +932,10 @@ void update_cx_when_cy_changed() {
 }
 
 void copy_to_clipboard(const std::string& text) {
-    E.keylog << "[start]" << text << "[end]";
+    E.dbglog("[start]");
+    E.dbglog(text);
+    E.dbglog("[end]");
+
     E.clipboard = text;
 }
 
@@ -1708,8 +1723,10 @@ void init_editor() {
     E.cmdline_msg_time = 0;
     E.quit_times = NUM_FORCE_QUIT_PRESS;
     E.undo_pos = -1;
+#ifdef DBGLOG
     E.keylog = std::ofstream("key.txt", std::ios_base::app);
     E.keylog << "\n============= new stream ==========\n";
+#endif
 }
 
 int main(int argc, char** argv) {
