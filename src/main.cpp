@@ -44,29 +44,30 @@ enum EditorAction {
     CURSOR_RIGHT,
     CURSOR_LINE_BEGIN,
     CURSOR_LINE_END,
+    CURSOR_FORWARD_WORD,
+    CURSOR_BACKWARD_WORD,
+    CURSOR_FIRST_ROW,
+    CURSOR_LAST_ROW,
+    CURSOR_PAGE_UP,
+    CURSOR_PAGE_DOWN,
     CHANGE_MODE_TO_NORMAL,
     CHANGE_MODE_TO_INSERT,
     CHANGE_MODE_TO_COMMAND,
     CHANGE_MODE_TO_SEARCH,
     SET_MARK,
-    CUT_CURSOR_MARK_REGION,
-    CURSOR_FORWARD_WORD,
-    CURSOR_BACKWARD_WORD,
-    CURSOR_FIRST_ROW,
-    CURSOR_LAST_ROW,
-    INSERT_NEWLINE,
-    INSERT_CHAR,
-    DELETE_LEFT_CHAR,
-    DELETE_CURRENT_CHAR,
-    PASTE_FROM_CLIPBOARD,
-    OPEN_LINE_BELOW_CURSOR,
-    SAVE_FILE,
     EXIT_EDITOR,
     FORCE_EXIT_EDITOR,
-    CURSOR_PAGE_UP,
-    CURSOR_PAGE_DOWN,
+    SAVE_FILE,
     REPEAT_SEARCH_FORWARD,
     REPEAT_SEARCH_BACKWARD,
+
+    CUT_CURSOR_MARK_REGION,
+    INSERT_NEWLINE,
+    INSERT_CHAR,
+    DELETE_CURRENT_CHAR,
+    DELETE_LEFT_CHAR,
+    PASTE_FROM_CLIPBOARD,
+    OPEN_LINE_BELOW_CURSOR,
 };
 
 enum EditorKey {
@@ -988,7 +989,7 @@ void do_set_mark() {
     E.my = E.cy;
 }
 
-void do_cut_cursor_mark_region() {
+void do_cut_cursor_mark_region(bool hist) {
     int startx, starty, endx, endy;
     if (E.my < E.cy) {
         starty = E.my;
@@ -1051,6 +1052,7 @@ void do_cut_cursor_mark_region() {
 
     E.set_cpos(startx, starty);
     copy_to_clipboard(copy);
+    if (hist) push_undoinfo(CUT_CURSOR_MARK_REGION, copy);
 }
 
 void do_cursor_forward_word() {
@@ -1112,15 +1114,18 @@ void do_insert_char(bool hist, int c) {
     E.set_cpos(E.cx+1, E.cy);
 }
 
-void do_delete_left_char() {
+void do_delete_left_char(bool hist) {
     if (E.cx == 0 && E.cy == 0) return;
     EditorRow* row = E.get_row_at(E.cy);
 
     if (E.cx > 0) {
+        char c = row->data[E.cx-1];
         row_delete_range(row, E.cx-1, 1);
         E.set_cpos(E.cx-1, E.cy);
+        if (hist) push_undoinfo(DELETE_LEFT_CHAR, std::string(1, c));
     } else {
         E.set_cpos(E.get_row_at(E.cy-1)->len(), E.cy-1);
+        if (hist) push_undoinfo(DELETE_LEFT_CHAR, std::string(1, '\n'));
         row_append_string(E.get_row_at(E.cy), row->data);
         delete_row(E.cy+1);
     }
@@ -1134,7 +1139,7 @@ void do_delete_current_char(bool hist) {
 
     if (E.cx == row->len()) {
         if (E.cy < E.lastrow_idx()) {
-            if (hist) push_undoinfo(DELETE_CURRENT_CHAR, std::string("\n"));
+            if (hist) push_undoinfo(DELETE_CURRENT_CHAR, std::string(1, '\n'));
             row_append_string(row, E.get_row_at(E.cy+1)->data);
             delete_row(E.cy+1);
         }
@@ -1146,15 +1151,17 @@ void do_delete_current_char(bool hist) {
     delete_empty_row_if_file_empty();
 }
 
-void do_paste_from_clipboard() {
+void do_paste_from_clipboard(bool hist) {
     const std::string& clip = E.clipboard;
+    if (hist) push_undoinfo(PASTE_FROM_CLIPBOARD, clip);
     usize sz = clip.size();
     for (usize i = 0; i < sz; i++) {
         do_insert_char(false, clip[i]);
     }
 }
 
-void do_open_line_below_cursor() {
+void do_open_line_below_cursor(bool hist) {
+    if (hist) push_undoinfo(OPEN_LINE_BELOW_CURSOR, "");
     insert_row(E.cy+1, "");
     E.set_cpos(0, E.cy+1);
     row_indent_to_prev_indent(E.get_row_at(E.cy));
@@ -1238,9 +1245,14 @@ void do_repeat_search_backward() {
 }
 
 void do_undo_or_redo(bool undo) {
-    if (E.numundos() == 0) return;
-    if (undo && E.undo_pos == -1) return;
-    if (!undo && E.undo_pos == E.numundos()-1) return;
+    if (E.numundos() == 0 || (undo && E.undo_pos == -1)) {
+        set_cmdline_msg_error("already at oldest change");
+        return;
+    }
+    if (!undo && E.undo_pos == E.numundos()-1) {
+        set_cmdline_msg_error("already at newest change");
+        return;
+    }
 
     int uidx = undo ? E.undo_pos : E.undo_pos+1;
     if (undo) E.undo_pos--;
@@ -1250,10 +1262,12 @@ void do_undo_or_redo(bool undo) {
 
     if ((u.type == INSERT_CHAR && undo)
             || (u.type == INSERT_NEWLINE && undo)
-            || (u.type == DELETE_CURRENT_CHAR && !undo)) {
+            || (u.type == DELETE_CURRENT_CHAR && !undo)
+            || (u.type == DELETE_LEFT_CHAR && !undo)) {
         E.set_cpos(u.x, u.y);
         do_delete_current_char(false);
     } else if ((u.type == DELETE_CURRENT_CHAR && undo)
+            || (u.type == DELETE_LEFT_CHAR && undo)
             || (u.type == INSERT_CHAR && !undo)
             || (u.type == INSERT_NEWLINE && !undo)) {
         E.set_cpos(u.x, u.y);
@@ -1265,7 +1279,27 @@ void do_undo_or_redo(bool undo) {
         else if (u.type == INSERT_NEWLINE) x = 0;
         if (u.type == INSERT_NEWLINE) y += 1;
 
-        E.set_cpos(x, y);
+        if (u.type != DELETE_LEFT_CHAR) E.set_cpos(x, y);
+    } else if ((u.type == CUT_CURSOR_MARK_REGION && undo)
+            || (u.type == PASTE_FROM_CLIPBOARD && !undo)) {
+        E.set_cpos(u.x, u.y);
+        for (int i = 0; i < (int)u.data.size(); i++) {
+            do_insert_char(false, u.data[i]);
+        }
+    } else if ((u.type == PASTE_FROM_CLIPBOARD && undo)
+            || (u.type == CUT_CURSOR_MARK_REGION && !undo)) {
+        E.set_cpos(u.x, u.y);
+        for (int i = 0; i < (int)u.data.size(); i++) {
+            do_delete_current_char(false);
+        }
+    } else if (u.type == OPEN_LINE_BELOW_CURSOR) {
+        E.set_cpos(u.x, u.y);
+        if (undo) {
+            delete_row(u.y+1);
+        } else {
+            do_open_line_below_cursor(false);
+            do_change_mode_to_normal();
+        }
     } else {
         set_cmdline_msg_error("[internal] don't know how to undo last change");
     }
@@ -1284,16 +1318,16 @@ void do_action(int action, ...) {
         case CHANGE_MODE_TO_COMMAND:         do_change_mode_to_command(); break;
         case CHANGE_MODE_TO_SEARCH:          do_change_mode_to_search(); break;
         case SET_MARK:                       do_set_mark(); break;
-        case CUT_CURSOR_MARK_REGION:         do_cut_cursor_mark_region(); break;
+        case CUT_CURSOR_MARK_REGION:         do_cut_cursor_mark_region(true); break;
         case CURSOR_FORWARD_WORD:            do_cursor_forward_word(); break;
         case CURSOR_BACKWARD_WORD:           do_cursor_backward_word(); break;
         case CURSOR_FIRST_ROW:               do_cursor_first_row(); break;
         case CURSOR_LAST_ROW:                do_cursor_last_row(); break;
         case INSERT_NEWLINE:                 do_insert_newline(true, true); break;
-        case DELETE_LEFT_CHAR:               do_delete_left_char(); break;
+        case DELETE_LEFT_CHAR:               do_delete_left_char(true); break;
         case DELETE_CURRENT_CHAR:            do_delete_current_char(true); break;
-        case PASTE_FROM_CLIPBOARD:           do_paste_from_clipboard(); break;
-        case OPEN_LINE_BELOW_CURSOR:         do_open_line_below_cursor(); break;
+        case PASTE_FROM_CLIPBOARD:           do_paste_from_clipboard(true); break;
+        case OPEN_LINE_BELOW_CURSOR:         do_open_line_below_cursor(true); break;
         case SAVE_FILE:                      do_save_file(); break;
         case EXIT_EDITOR:                    do_exit_editor(); return;
         case FORCE_EXIT_EDITOR:              do_force_exit_editor(); return;
@@ -1597,7 +1631,8 @@ void draw_debug_info() {
     ewrite("\r\n");
     ewrite("\x1b[K");
     std::string debug_info = fmt::format(
-        "cmdx: {}, cmdoff: {}, len(cmd): {}, rows: {}, cx = {}, cy: {}, cx (calc): {}, rx: {}, tx: {}",
+        "undo_pos: {}, cmdx: {}, cmdoff: {}, len(cmd): {}, rows: {}, cx = {}, cy: {}, cx (calc): {}, rx: {}, tx: {}",
+        E.undo_pos,
         E.cmdx,
         E.cmdoff,
         E.cmdline.size(),
