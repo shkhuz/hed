@@ -9,11 +9,20 @@ FLAGS := -g -O0 -Wall -Wextra -Wno-unused-parameter -Wno-write-strings
 ifdef d
 	FLAGS += -D_DEBUG
 endif
+PREFIX := /usr/local
 
 CC := clang++
 
 run: build/hed
 	./build/hed tabtest.txt
+
+install: build/hed
+	@mkdir -p $(DESTDIR)$(PREFIX)/bin
+	cp -f $^ $(DESTDIR)$(PREFIX)/bin/hed
+	chmod 755 $(DESTDIR)$(PREFIX)/bin/hed
+
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/bin/hed
 
 debug: build/hed
 	gdb --args ./build/hed tabtest.txt
