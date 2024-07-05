@@ -50,6 +50,8 @@ enum EditorAction {
     CURSOR_LAST_ROW,
     CURSOR_PAGE_UP,
     CURSOR_PAGE_DOWN,
+    CURSOR_NEXT_PARA,
+    CURSOR_PREV_PARA,
     CHANGE_MODE_TO_NORMAL,
     CHANGE_MODE_TO_INSERT,
     CHANGE_MODE_TO_COMMAND,
@@ -671,13 +673,8 @@ int row_get_indent(EditorRow* row) {
     return indent;
 }
 
-void row_set_indent(EditorRow* row, int indent) {
-    int current_indent = row_get_indent(row);
-    row_delete_range(row, 0, current_indent);
-
-    for (int i = 0; i < indent; i++) {
-        row_insert_char(row, 0, '\t');
-    }
+void row_indent(EditorRow* row) {
+    row_insert_char(row, 0, '\t');
 }
 
 template<typename... Args>
@@ -883,7 +880,8 @@ void insert_empty_row_if_file_empty() {
     }
 }
 
-void row_indent_to_prev_indent(EditorRow* row_to_indent) {
+void autoindent_just_after_newline() {
+    if (E.cx != 0) return;
     int target_indent = 0;
     bool found_indent = false;
 
@@ -904,10 +902,10 @@ void row_indent_to_prev_indent(EditorRow* row_to_indent) {
         if (found_indent) break;
     }
 
-    int indent_by = target_indent - row_get_indent(row_to_indent);
-    if (indent_by > 0) {
-        row_set_indent(row_to_indent, indent_by);
-        E.set_cpos(E.cx+indent_by, E.cy);
+    EditorRow* row_to_indent = E.get_row_at(E.cy);
+    for (int i = 0; i < target_indent; i++) {
+        row_indent(row_to_indent);
+        E.set_cpos(E.cx+target_indent, E.cy);
     }
 }
 
@@ -1097,6 +1095,45 @@ void do_cursor_last_row() {
     update_cx_when_cy_changed();
 }
 
+bool is_row_only_ws(EditorRow* row) {
+    if (row->len() == 0) return true;
+    for (int i = 0; i < row->len(); i++) {
+        char c = row->data[i];
+        if (c != '\t' && c != ' ') {
+            return false;
+        }
+    }
+    return true;
+}
+
+void do_cursor_next_para() {
+    if (E.cy == E.lastrow_idx()) return;
+    E.cy++;
+
+    while (E.cy != E.lastrow_idx() && is_row_only_ws(E.get_row_at(E.cy))) {
+        E.cy++;
+    }
+
+    while (E.cy != E.lastrow_idx() && !is_row_only_ws(E.get_row_at(E.cy))) {
+        E.cy++;
+    }
+    update_cx_when_cy_changed();
+}
+
+void do_cursor_prev_para() {
+    if (E.cy == 0) return;
+    E.cy--;
+
+    while (E.cy != 0 && is_row_only_ws(E.get_row_at(E.cy))) {
+        E.cy--;
+    }
+
+    while (E.cy != 0 && !is_row_only_ws(E.get_row_at(E.cy))) {
+        E.cy--;
+    }
+    update_cx_when_cy_changed();
+}
+
 void do_insert_newline(bool hist, bool autoindent) {
     if (hist) push_undoinfo(INSERT_NEWLINE, std::string(1, '\n'));
     insert_empty_row_if_file_empty();
@@ -1110,7 +1147,7 @@ void do_insert_newline(bool hist, bool autoindent) {
         update_row(row);
     }
     E.set_cpos(0, E.cy+1);
-    if (autoindent) row_indent_to_prev_indent(E.get_row_at(E.cy));
+    if (autoindent) autoindent_just_after_newline();
 }
 
 void do_insert_char(bool hist, int c) {
@@ -1179,7 +1216,7 @@ void do_open_line_below_cursor(bool hist) {
     if (hist) push_undoinfo(OPEN_LINE_BELOW_CURSOR, "");
     insert_row(E.cy+1, "");
     E.set_cpos(0, E.cy+1);
-    row_indent_to_prev_indent(E.get_row_at(E.cy));
+    autoindent_just_after_newline();
     do_change_mode_to_insert();
 }
 
@@ -1348,6 +1385,8 @@ void do_action(int action, ...) {
         case FORCE_EXIT_EDITOR:              do_force_exit_editor(); return;
         case CURSOR_PAGE_UP:                 do_cursor_page_up(); break;
         case CURSOR_PAGE_DOWN:               do_cursor_page_down(); break;
+        case CURSOR_PREV_PARA:               do_cursor_prev_para(); break;
+        case CURSOR_NEXT_PARA:               do_cursor_next_para(); break;
         case REPEAT_SEARCH_FORWARD:          do_repeat_search_forward(); break;
         case REPEAT_SEARCH_BACKWARD:         do_repeat_search_backward(); break;
         case INSERT_CHAR: {
@@ -1390,6 +1429,8 @@ void process_keypress() {
             case 'l':                   do_action(CURSOR_RIGHT); break;
             case 'o':                   do_action(CURSOR_FORWARD_WORD); break;
             case 'n':                   do_action(CURSOR_BACKWARD_WORD); break;
+            case 'u':                   do_action(CURSOR_PREV_PARA); break;
+            case 'm':                   do_action(CURSOR_NEXT_PARA); break;
             case ',':                   do_action(OPEN_LINE_BELOW_CURSOR); break;
             case 'd':                   do_action(SET_MARK); break;
             case 'f':                   do_action(CUT_CURSOR_MARK_REGION); break;
