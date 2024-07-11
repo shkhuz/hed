@@ -12,7 +12,6 @@ make
 
 ## Missing features
 
-- Multiple files
-- Spaces for indentation
-- External clipboard
-- Documentation
+- Multiple files,
+- Multiple windows,
+- Documentation, etc.
