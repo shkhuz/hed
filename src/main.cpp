@@ -6,6 +6,7 @@
 #include <sys/ioctl.h>
 #include <cerrno>
 #include <cstdint>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -14,6 +15,7 @@
 #include <cstdarg>
 
 #include <fmt/format.h>
+#include <libclipboard.h>
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -29,6 +31,11 @@ typedef ssize_t isize;
 
 const int TAB_STOP = 4;
 const int NUM_FORCE_QUIT_PRESS = 2;
+
+// if set, outputs a `key.txt` file with keystokes and copy paste info.
+#undef DBGLOG
+// appends a line in the editor to show debug information
+#undef DBGLINE
 
 enum EditorMode {
     NORMAL,
@@ -66,6 +73,7 @@ enum EditorAction {
     CUT_CURSOR_MARK_REGION,
     INSERT_NEWLINE,
     INSERT_CHAR,
+    INSERT_INDENT,
     DELETE_CURRENT_CHAR,
     DELETE_LEFT_CHAR,
     PASTE_FROM_CLIPBOARD,
@@ -183,13 +191,13 @@ enum EditorHighlight {
     HL_CONST,
 };
 
-int hl_to_color(EditorHighlight hl) {
+inline int hl_to_color(EditorHighlight hl) {
     switch (hl) {
-        case HL_NUMBER: return 31;
+        case HL_NUMBER: return 35;
         case HL_STRING: return 35;
-        case HL_COMMENT: return 35;
-        case HL_KEYWORD: return 32;
-        case HL_TYPE: return 33;
+        case HL_COMMENT: return 248;
+        case HL_KEYWORD: return 63;
+        case HL_TYPE: return 63;
         case HL_CONST: return 35;
         default: return 37;
     }
@@ -256,6 +264,7 @@ struct EditorConfig {
     int cmdx, cmdoff;
     int hltsx, hltsy, hltex, hltey;
     EditorSyntax* syn;
+    bool indent_as_spaces;
 
     termios ogtermios;
     std::string abuf;
@@ -269,7 +278,7 @@ struct EditorConfig {
     int undo_pos;
     int quit_times;
     std::string search_default;
-    std::string clipboard;
+    clipboard_c* cb;
 
     std::ofstream keylog;
 
@@ -482,9 +491,12 @@ int get_window_size(int* rows, int* cols) {
         return get_cursor_position(rows, cols);
     } else {
         *cols = ws.ws_col;
-        // one line for status bar
-        //*rows = ws.ws_row-2;
-        *rows = ws.ws_row-3; // TODO: debug_temp
+#ifdef DBGLINE
+        *rows = ws.ws_row-3;
+#else
+        // one line for status bar, one for cmdline
+        *rows = ws.ws_row-2;
+#endif
     }
     return 0;
 }
@@ -667,14 +679,16 @@ void row_append_string(EditorRow* row, const std::string& str) {
     update_row(row);
 }
 
-int row_get_indent(EditorRow* row) {
+int row_get_indent_col(EditorRow* row) {
     int indent = 0;
-    while (indent < row->len() && row->data[indent] == '\t') indent++;
+    for (int i = 0; i < row->len(); i++) {
+        if (row->data[i] == '\t') {
+            indent += TAB_STOP;
+        } else if (row->data[i] == ' ') {
+            indent++;
+        } else break;
+    }
     return indent;
-}
-
-void row_indent(EditorRow* row) {
-    row_insert_char(row, 0, '\t');
 }
 
 template<typename... Args>
@@ -771,6 +785,10 @@ void push_undoinfo(EditorAction type, std::string data) {
 }
 
 const char* WHITESPACE = " \t\n\r\f\v";
+
+void str_trim_leading_ws(std::string& s) {
+    s.erase(0, s.find_first_not_of(WHITESPACE));
+}
 
 void str_trim_trailing_ws(std::string& s) {
     s.erase(s.find_last_not_of(WHITESPACE)+1);
@@ -880,35 +898,6 @@ void insert_empty_row_if_file_empty() {
     }
 }
 
-void autoindent_just_after_newline() {
-    if (E.cx != 0) return;
-    int target_indent = 0;
-    bool found_indent = false;
-
-    int cy = E.cy-1;
-    for (int i = cy; i >= 0; i--) {
-        EditorRow* row = E.get_row_at(i);
-        if (row->len() == 0) continue;
-        int cx = row->len();
-
-        for (; cx >= 0; cx--) {
-            if (row->data[cx] != '\t' && row->data[cx] != ' ') {
-                target_indent = row_get_indent(row);
-                found_indent = true;
-                break;
-            }
-        }
-
-        if (found_indent) break;
-    }
-
-    EditorRow* row_to_indent = E.get_row_at(E.cy);
-    for (int i = 0; i < target_indent; i++) {
-        row_indent(row_to_indent);
-        E.set_cpos(E.cx+target_indent, E.cy);
-    }
-}
-
 void delete_empty_row_if_file_empty() {
     EditorRow* row = E.get_row_at(E.cy);
     if (E.numrows() == 1 && row->len() == 0) {
@@ -934,7 +923,7 @@ void copy_to_clipboard(const std::string& text) {
     E.dbglog(text);
     E.dbglog("[end]");
 
-    E.clipboard = text;
+    clipboard_set_text_ex(E.cb, text.c_str(), text.size(), LCB_CLIPBOARD);
 }
 
 // ============= ACTIONS ==============
@@ -1134,6 +1123,59 @@ void do_cursor_prev_para() {
     update_cx_when_cy_changed();
 }
 
+void do_insert_char(bool hist, int c);
+
+void do_insert_indent(bool hist) {
+    if (E.indent_as_spaces) {
+        int spaces = ((TAB_STOP-1) - (E.rx%TAB_STOP)) + 1;
+        for (int i = 0; i < spaces; i++) do_insert_char(hist, ' ');
+    } else {
+        do_insert_char(hist, '\t');
+    }
+}
+
+void autoindent_just_after_newline() {
+    if (E.cx != 0) return;
+    int target_indent = 0;
+    bool found_indent = false;
+
+    int cy = E.cy-1;
+    for (int i = cy; i >= 0; i--) {
+        EditorRow* row = E.get_row_at(i);
+        if (row->len() == 0) continue;
+        int cx = row->len();
+
+        for (; cx >= 0; cx--) {
+            if (row->data[cx] != '\t' && row->data[cx] != ' ') {
+                target_indent = row_get_indent_col(row);
+                found_indent = true;
+                break;
+            }
+        }
+
+        if (found_indent) break;
+    }
+
+    if (found_indent) {
+        int ts_multiple = target_indent / TAB_STOP;
+        int ts_leftover = target_indent % TAB_STOP;
+
+        for (int i = 0; i < ts_multiple; i++) {
+            if (E.indent_as_spaces) {
+                for (int i = 0; i < TAB_STOP; i++) {
+                    do_insert_char(false, ' ');
+                }
+            } else {
+                do_insert_char(false, '\t');
+            }
+        }
+
+        for (int i = 0; i < ts_leftover; i++) {
+            do_insert_char(false, ' ');
+        }
+    }
+}
+
 void do_insert_newline(bool hist, bool autoindent) {
     if (hist) push_undoinfo(INSERT_NEWLINE, std::string(1, '\n'));
     insert_empty_row_if_file_empty();
@@ -1204,11 +1246,18 @@ void do_delete_current_char(bool hist) {
 }
 
 void do_paste_from_clipboard(bool hist) {
-    const std::string& clip = E.clipboard;
-    if (hist) push_undoinfo(PASTE_FROM_CLIPBOARD, clip);
-    usize sz = clip.size();
+    const char* text_c = clipboard_text_ex(E.cb, NULL, LCB_CLIPBOARD);
+    if (!text_c) {
+        set_cmdline_msg_error("nothing to paste");
+        return;
+    }
+    std::string text = std::string(text_c);
+    free((void*)text_c);
+
+    if (hist) push_undoinfo(PASTE_FROM_CLIPBOARD, text);
+    usize sz = text.size();
     for (usize i = 0; i < sz; i++) {
-        do_insert_char(false, clip[i]);
+        do_insert_char(false, text[i]);
     }
 }
 
@@ -1224,7 +1273,7 @@ void do_save_file() {
     file_trim_trailing_ws();
 
     if (E.path == "") {
-        set_cmdline_msg_info("no filename");
+        set_cmdline_msg_error("no filename");
         return;
     }
     std::string tmp_path = E.path + ".tmp";
@@ -1355,6 +1404,8 @@ void do_undo_or_redo(bool undo) {
     } else {
         set_cmdline_msg_error("[internal] don't know how to undo last change");
     }
+
+    if (undo && E.undo_pos == -1) E.dirty = false;
 }
 
 void do_action(int action, ...) {
@@ -1406,6 +1457,34 @@ void do_action(int action, ...) {
 
     E.quit_times = NUM_FORCE_QUIT_PRESS;
     E.reset_hlt();
+}
+
+void parse_and_run_command(const std::string& cmd) {
+    std::string cmd_nows = cmd;
+    str_trim_leading_ws(cmd_nows);
+    str_trim_trailing_ws(cmd_nows);
+
+    if (cmd_nows == "") {
+        set_cmdline_msg_error("empty command");
+        return;
+    };
+
+    std::vector<std::string> cmdspl;
+    std::istringstream ss(cmd_nows);
+    std::string s;
+    while (std::getline(ss, s, ' ')) {
+        cmdspl.push_back(s);
+    }
+
+    const std::string& name = cmdspl[0];
+    if (name == "set") {
+    } else if (name == "exit") {
+        if (cmdspl.size() == 1) do_action(EXIT_EDITOR);
+        else if (cmdspl[1] == "--force") do_action(FORCE_EXIT_EDITOR);
+        else set_cmdline_msg_error("exit: unknown extra arguments");
+    } else {
+        set_cmdline_msg_error("unknown command '{}'", name);
+    }
 }
 
 void process_keypress() {
@@ -1461,7 +1540,7 @@ void process_keypress() {
         switch (c) {
             case BACKSPACE:             do_action(DELETE_LEFT_CHAR); break;
             case '\r':                  do_action(INSERT_NEWLINE); break;
-            case '\t':                  do_insert_char(true, c); break;
+            case '\t':                  do_insert_indent(true); break;
             case ARROW_LEFT:            do_action(CURSOR_LEFT); break;
             case ARROW_DOWN:            do_action(CURSOR_DOWN); break;
             case ARROW_UP:              do_action(CURSOR_UP); break;
@@ -1481,12 +1560,7 @@ void process_keypress() {
                 do_action(CHANGE_MODE_TO_NORMAL);
 
                 if (mode == COMMAND) {
-                    if (txt == "quit") do_action(EXIT_EDITOR);
-                    else if (txt == "forcequit") do_action(FORCE_EXIT_EDITOR);
-                    else if (str_startswith(txt, "path")) {
-                        set_path(txt.substr(5));
-                    }
-                    else set_cmdline_msg_error("unknown command '{}'", txt);
+                    parse_and_run_command(txt);
                 } else if (mode == SEARCH) {
                     E.search_default = txt;
                     search_text_forward(txt, true);
@@ -1572,7 +1646,7 @@ void draw_rows() {
             if (rowlen < 0) rowlen = 0;
             if (rowlen > E.screencols) rowlen = E.screencols;
 
-            char* c = &E.get_row_at(filerow)->rdata.data()[E.coloff];
+            const char* c = &E.get_row_at(filerow)->rdata.data()[E.coloff];
             u8* hl = &E.get_row_at(filerow)->hl[E.coloff];
             int current_color = -1;
 
@@ -1601,7 +1675,7 @@ void draw_rows() {
                     }
                 } else if (hl[i] == HL_NORMAL) {
                     if (current_color != -1) {
-                        ewrite("\x1b[39m");
+                        ewrite("\x1b[0m");
                         current_color = -1;
                     }
                     ewrite_cstr_with_len(&c[i], 1);
@@ -1609,7 +1683,12 @@ void draw_rows() {
                     int color = hl_to_color((EditorHighlight)hl[i]);
                     if (color != current_color) {
                         current_color = color;
-                        ewrite(fmt::format("\x1b[{}m", color));
+                        if (hl[i] == HL_KEYWORD || hl[i] == HL_TYPE)
+                            ewrite(fmt::format("\x1b[1;38;5;{}m", color));
+                        else if (hl[i] == HL_COMMENT)
+                            ewrite(fmt::format("\x1b[38;5;{}m", color));
+                        else
+                            ewrite(fmt::format("\x1b[{}m", color));
                     }
                     ewrite_cstr_with_len(&c[i], 1);
                 }
@@ -1632,7 +1711,7 @@ void draw_status_bar() {
     }
 
     std::string lstatus = fmt::format(
-            "[{}{}] {:.20}",
+            "[{}{}] {}",
             E.dirty ? '*' : '-',
             E.mode == INSERT ? 'I' : 'N',
             E.path != "" ? E.path : "[No name]");
@@ -1640,7 +1719,7 @@ void draw_status_bar() {
     if (llen > E.screencols) llen = E.screencols;
 
     std::string rstatus = fmt::format(
-        "{} {}/{}",
+        "{} {}/{} ",
         E.syn ? E.syn->filetype : "none",
         E.cy+1,
         E.numrows());
@@ -1717,7 +1796,9 @@ void refresh_screen() {
     draw_rows();
     draw_status_bar();
     draw_cmdline();
+#ifdef DBGLINE
     draw_debug_info();
+#endif
 
     char buf[32];
     usize len;
@@ -1757,6 +1838,7 @@ void init_editor() {
     E.cmdx = 0;
     E.cmdoff = 0;
     E.syn = NULL;
+    E.indent_as_spaces = true;
     E.reset_hlt();
     if (get_window_size(&E.screenrows, &E.screencols) == -1)
         core::error_exit_from("get_window_size");
@@ -1768,6 +1850,7 @@ void init_editor() {
     E.keylog = std::ofstream("key.txt", std::ios_base::app);
     E.keylog << "\n============= new stream ==========\n";
 #endif
+    E.cb = clipboard_new(NULL);
 }
 
 int main(int argc, char** argv) {

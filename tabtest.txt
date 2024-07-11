@@ -1,7 +1,0 @@
-int main() {
-	printf("hello world!");
-	if (false) {
-
-		exit();
-	}
-}
