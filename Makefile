@@ -30,7 +30,7 @@ uninstall:
 debug: build/hed
 	gdb --args ./build/hed tests/example_cpp.cpp
 
-build/hed: $(OBJS) build/fmt/libfmt.a build/libclipboard/lib/libclipboard.a
+build/hed: $(OBJS) build/fmt/libfmt.a build/libclipboard/lib/libclipboard.a 
 	$(CC) -o build/hed $(FLAGS) $(OBJS) $(LIBS)
 
 build/fmt/libfmt.a:
@@ -41,13 +41,13 @@ build/libclipboard/lib/libclipboard.a:
 	@mkdir -p $(dir $@)
 	cd build/libclipboard; cmake ../../thirdparty/libclipboard && make
 
-build/obj/%.cpp.o: %.cpp
+build/obj/%.cpp.o: %.cpp build/libclipboard/lib/libclipboard.a 
 	@mkdir -p $(dir $@)
-	$(CC) -c $^ $(FLAGS) -o $@ $(INCLUDES)
+	$(CC) -c $< $(FLAGS) -o $@ $(INCLUDES)
 
-build/obj/%.cc.o: %.cc
+build/obj/%.cc.o: %.cc build/libclipboard/lib/libclipboard.a 
 	@mkdir -p $(dir $@)
-	$(CC) -c $^ $(FLAGS) -o $@ $(INCLUDES)
+	$(CC) -c $< $(FLAGS) -o $@ $(INCLUDES)
 
 clean:
 	rm -rf build/
