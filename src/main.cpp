@@ -78,6 +78,8 @@ enum EditorAction {
     DELETE_LEFT_CHAR,
     PASTE_FROM_CLIPBOARD,
     OPEN_LINE_BELOW_CURSOR,
+
+    AUTOINDENT_JUST_AFTER_NEWLINE,
 };
 
 enum EditorKey {
@@ -1134,7 +1136,7 @@ void do_insert_indent(bool hist) {
     }
 }
 
-void autoindent_just_after_newline() {
+void autoindent_just_after_newline(bool hist) {
     if (E.cx != 0) return;
     int target_indent = 0;
     bool found_indent = false;
@@ -1173,6 +1175,10 @@ void autoindent_just_after_newline() {
         for (int i = 0; i < ts_leftover; i++) {
             do_insert_char(false, ' ');
         }
+
+        if (target_indent != 0 && hist) {
+            push_undoinfo(AUTOINDENT_JUST_AFTER_NEWLINE, "");
+        }
     }
 }
 
@@ -1189,7 +1195,7 @@ void do_insert_newline(bool hist, bool autoindent) {
         update_row(row);
     }
     E.set_cpos(0, E.cy+1);
-    if (autoindent) autoindent_just_after_newline();
+    if (autoindent) autoindent_just_after_newline(hist);
 }
 
 void do_insert_char(bool hist, int c) {
@@ -1265,7 +1271,7 @@ void do_open_line_below_cursor(bool hist) {
     if (hist) push_undoinfo(OPEN_LINE_BELOW_CURSOR, "");
     insert_row(E.cy+1, "");
     E.set_cpos(0, E.cy+1);
-    autoindent_just_after_newline();
+    autoindent_just_after_newline(hist);
     do_change_mode_to_insert();
 }
 
@@ -1291,7 +1297,7 @@ void do_save_file() {
 
 void do_exit_editor() {
     if (E.dirty && E.quit_times > 0) {
-        set_cmdline_msg_error("File has unsaved changes: press [backtick] {} more times to quit", E.quit_times);
+        set_cmdline_msg_error("File has unsaved changes: press [backtick] {} more times to quit or use 'exit --force'", E.quit_times);
         E.quit_times--;
     } else {
         core::succ_exit();
@@ -1401,6 +1407,14 @@ void do_undo_or_redo(bool undo) {
             do_open_line_below_cursor(false);
             do_change_mode_to_normal();
         }
+    } else if (u.type == AUTOINDENT_JUST_AFTER_NEWLINE) {
+        if (undo) {
+            E.set_cpos(u.x, u.y);
+            while (E.cx != 0) do_delete_left_char(false);
+        } else {
+            E.set_cpos(0, u.y);
+            autoindent_just_after_newline(false);
+        }
     } else {
         set_cmdline_msg_error("[internal] don't know how to undo last change");
     }
@@ -1459,31 +1473,117 @@ void do_action(int action, ...) {
     E.reset_hlt();
 }
 
-void parse_and_run_command(const std::string& cmd) {
-    std::string cmd_nows = cmd;
-    str_trim_leading_ws(cmd_nows);
-    str_trim_trailing_ws(cmd_nows);
+struct CommandInfo {
+    std::string name;
+    int args;
+    std::string* flags;
+};
 
-    if (cmd_nows == "") {
-        set_cmdline_msg_error("empty command");
-        return;
-    };
+std::string exit_flags[] = { "--force", "" };
 
-    std::vector<std::string> cmdspl;
-    std::istringstream ss(cmd_nows);
-    std::string s;
-    while (std::getline(ss, s, ' ')) {
-        cmdspl.push_back(s);
+CommandInfo CMDDB[] = {
+    { "exit", 0, exit_flags },
+    { "set", 2, NULL },
+};
+#define NUM_CMDDB (sizeof(CMDDB) / sizeof(CMDDB[0]))
+
+struct CommandParser {
+    std::string name;
+    std::vector<std::string> args;
+    std::vector<std::string> flags;
+    CommandInfo* entry = NULL;
+
+    bool parse(const std::string& cmd) {
+        std::string cmd_nows = cmd;
+        str_trim_leading_ws(cmd_nows);
+        str_trim_trailing_ws(cmd_nows);
+
+        if (cmd_nows == "") {
+            set_cmdline_msg_error("empty command");
+            return false;
+        };
+
+        std::istringstream ss(cmd_nows);
+        std::string s;
+        bool is_name = true;
+        while (std::getline(ss, s, ' ')) {
+            if (is_name) {
+                name = s;
+                is_name = false;
+            } else if (str_startswith(s, "-")) {
+                flags.push_back(s);
+            } else {
+                args.push_back(s);
+            }
+        }
+
+        for (usize i = 0; i < NUM_CMDDB; i++) {
+            if (CMDDB[i].name == name) {
+                entry = &CMDDB[i];    
+                break;
+            }
+        }
+
+        if (!entry) {
+            set_cmdline_msg_error("unknown command '{}'", name);
+            return false;
+        }
+
+        if ((int)args.size() != entry->args) {
+            set_cmdline_msg_error("expected {} args, got {}", entry->args, args.size());
+            return false;
+        }
+
+        if (!entry->flags && flags.size() != 0) {
+            set_cmdline_msg_error("unknown flag '{}'", flags[0]);
+            return false;
+        } else {
+            for (usize i = 0; i < flags.size(); i++) {
+                bool found = false;
+                for (usize j = 0; entry->flags[j] != ""; j++) {
+                    if (flags[i] == entry->flags[j]) {
+                        found = true;
+                        break;
+                    }
+                }
+                
+                if (!found) {
+                    set_cmdline_msg_error("unknown flag '{}'", flags[i]);
+                    // We don't check all flags and exit early, because we
+                    // can only show one error at a time.
+                    return false;
+                }
+            }
+        }
+
+        return true;
     }
 
-    const std::string& name = cmdspl[0];
-    if (name == "set") {
-    } else if (name == "exit") {
-        if (cmdspl.size() == 1) do_action(EXIT_EDITOR);
-        else if (cmdspl[1] == "--force") do_action(FORCE_EXIT_EDITOR);
-        else set_cmdline_msg_error("exit: unknown extra arguments");
-    } else {
-        set_cmdline_msg_error("unknown command '{}'", name);
+    bool flag_set(const std::string& flag) {
+        for (usize i = 0; i < flags.size(); i++) {
+            if (flags[i] == flag) return true;
+        }
+        return false;
+    }
+};
+
+void parse_and_run_command(const std::string& cmd) {
+    CommandParser parser;
+    if (!parser.parse(cmd)) return;
+
+    if (parser.name == "exit") {
+        if (parser.flag_set("--force")) {
+            do_action(FORCE_EXIT_EDITOR);
+        } else {
+            do_action(EXIT_EDITOR);
+        }
+    } else if (parser.name == "set") {
+        if (parser.args[0] == "path") {
+            set_path(parser.args[1]);
+        } else {
+            set_cmdline_msg_error("unknown variable '{}'", parser.args[0]);
+            return;
+        }
     }
 }
 
