@@ -1594,8 +1594,8 @@ void process_keypress() {
             case 'i':                   do_action(CHANGE_MODE_TO_INSERT); break;
             case 'w':                   do_action(DELETE_CURRENT_CHAR); break;
             case '`':                   do_action(EXIT_EDITOR); break;
-            case 'U':                   do_action(CURSOR_PAGE_UP); break;
-            case 'M':                   do_action(CURSOR_PAGE_DOWN); break;
+            case CTRL_KEY('k'):         do_action(CURSOR_PAGE_UP); break;
+            case CTRL_KEY('j'):         do_action(CURSOR_PAGE_DOWN); break;
             case 'a':                   do_action(CURSOR_LINE_BEGIN); break;
             case ';':                   do_action(CURSOR_LINE_END); break;
             case ARROW_LEFT:            do_action(CURSOR_LEFT); break;
@@ -1608,8 +1608,8 @@ void process_keypress() {
             case 'l':                   do_action(CURSOR_RIGHT); break;
             case 'o':                   do_action(CURSOR_FORWARD_WORD); break;
             case 'n':                   do_action(CURSOR_BACKWARD_WORD); break;
-            case 'u':                   do_action(CURSOR_PREV_PARA); break;
-            case 'm':                   do_action(CURSOR_NEXT_PARA); break;
+            case 'K':                   do_action(CURSOR_PREV_PARA); break;
+            case 'J':                   do_action(CURSOR_NEXT_PARA); break;
             case ',':                   do_action(OPEN_LINE_BELOW_CURSOR); break;
             case 'd':                   do_action(SET_MARK); break;
             case 'f':                   do_action(CUT_CURSOR_MARK_REGION); break;

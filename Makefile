@@ -14,7 +14,7 @@ ifdef d
 endif
 PREFIX := /usr/local
 
-CC := clang++
+CC := g++
 
 run: build/hed
 	./build/hed tests/example_cpp.cpp
@@ -39,7 +39,7 @@ build/fmt/libfmt.a:
 
 build/libclipboard/lib/libclipboard.a:
 	@mkdir -p $(dir $@)
-	cd build/libclipboard; cmake ../../thirdparty/libclipboard && make
+	cd build/libclipboard; cmake -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ ../../thirdparty/libclipboard && make
 
 build/obj/%.cpp.o: %.cpp build/libclipboard/lib/libclipboard.a 
 	@mkdir -p $(dir $@)
